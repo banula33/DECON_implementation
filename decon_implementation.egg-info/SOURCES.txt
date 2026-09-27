@@ -1,0 +1,13 @@
+README.md
+pyproject.toml
+decon/__init__.py
+decon/adapters.py
+decon/ggdo.py
+decon/pipeline.py
+decon/types.py
+decon_implementation.egg-info/PKG-INFO
+decon_implementation.egg-info/SOURCES.txt
+decon_implementation.egg-info/dependency_links.txt
+decon_implementation.egg-info/requires.txt
+decon_implementation.egg-info/top_level.txt
+tests/test_ggdo.py

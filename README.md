@@ -1,5 +1,97 @@
 # DECON Implementation Guide
 
+## Current implementation
+
+The first implementation slice is available in `decon/`:
+
+```text
+decon/
+├── adapters.py   # SAT-HMR, SAM 2, renderer, and PowerPaint interfaces
+├── ggdo.py       # two-stage differentiable mask optimization
+├── pipeline.py   # estimate -> segment -> GGDO -> inpaint
+└── types.py      # typed per-person inputs and outputs
+```
+
+Install the base dependency with `pip install -r requirements.txt`. The
+external model adapters are intentionally injected: SAT-HMR, SAM 2, and
+PowerPaint each require their own checkpoints and installation instructions.
+The numerical GGDO contract is covered by `tests/test_ggdo.py` using a small
+differentiable renderer. A production renderer should implement
+`MeshRenderer.render_mask` with PyTorch3D and return a soft `[height, width]`
+mask so gradients can reach translation and SMPL parameters.
+
+The current optimizer uses a vertex-space delta for the second stage. This is
+an adapter-neutral stand-in for SMPL pose and shape optimization; the SAT-HMR
+adapter should expose pose/shape parameters when it is connected so those
+parameters can replace the delta directly.
+
+## Official model adapters
+
+`decon.official_adapters` connects the pipeline to the official DECON
+checkout. The checkout cloned for this workspace is `../DECON_official`.
+The adapters are lazy, so importing `decon` does not require all model
+packages or checkpoints to be installed.
+
+Required official assets:
+
+- SAT-HMR: place the official SAT-HMR weights and SMPL files under
+    `Multi-View_Synthesis/Geo_Gui_Hm_Decou/Human_SMPL_Estimation/weights`.
+
+After downloading the licensed SMPL files and SAT-HMR `.pth` checkpoint into
+one local folder, prepare the official layout with:
+
+```powershell
+python scripts\prepare_sat_hmr_weights.py C:\path\to\downloaded\weights
+```
+
+The script renames the three SMPL files to `SMPL_FEMALE.pkl`,
+`SMPL_MALE.pkl`, and `SMPL_NEUTRAL.pkl`, copies SAT-HMR `.pth` files into
+`weights/sat_hmr`, and refuses to overwrite existing files.
+- SAM 2: install the dependencies described in its `INSTALL.md` and download
+    the checkpoint with `Img_Segmentation/checkpoints/download_ckpts.sh`.
+- PowerPaint: install its environment from `Img_Inpainting` and download the
+    `ppt-v2` checkpoint directory described in the official README.
+- PyTorch3D: install a build matching the installed PyTorch and CUDA versions.
+
+Example wiring:
+
+```python
+from pathlib import Path
+
+from decon import (
+        HumanDecouplingPipeline,
+        OfficialPowerPaintInpainter,
+        OfficialSATHMRGeometryEstimator,
+        OfficialSAM2Segmenter,
+        PyTorch3DSilhouetteRenderer,
+)
+
+official = Path("../DECON_official/Multi-View_Synthesis/Geo_Gui_Hm_Decou")
+sat = OfficialSATHMRGeometryEstimator(official / "Human_SMPL_Estimation")
+sam = OfficialSAM2Segmenter(official / "Img_Segmentation")
+paint = OfficialPowerPaintInpainter(
+        official / "Img_Inpainting", official / "Img_Inpainting/checkpoints/ppt-v2"
+)
+# Load SAT-HMR's SMPL face tensor and create the original-view camera here.
+renderer = PyTorch3DSilhouetteRenderer(faces, (image_height, image_width))
+pipeline = HumanDecouplingPipeline(sat, sam, renderer, paint)
+persons = pipeline.run(input_image_path)
+```
+
+SAT-HMR's official `demo.yaml` expects the input image in its `demo/` folder
+and writes `demo_results/`; the adapter follows that contract and parses its
+`*_smpl_para.json` and `*_smpl_mesh.obj` outputs. PowerPaint v2 and the
+official renderer require a CUDA device.
+
+Run the local setup check before downloading or installing model assets:
+
+```powershell
+python scripts/check_official_setup.py
+```
+
+This reports checkpoint presence, PyTorch/CUDA status, and the exact reason
+inference cannot run on a CPU-only installation.
+
 This guide provides a step-by-step roadmap to implement the **DECON** (DEcouple-and-reCONstruct) framework from scratch, based on the provided research paper. 
 
 DECON reconstructs clothed-geometric multiple humans from a single image. The pipeline is broken down into three main stages: Decoupling, Reconstruction, and Position Optimization.

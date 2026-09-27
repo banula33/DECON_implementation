@@ -1,0 +1,9 @@
+# Base runtime
+-r requirements.txt
+numpy
+Pillow
+trimesh
+
+# Install SAT-HMR, SAM 2, PyTorch3D, and PowerPaint from their official
+# repositories using the instructions in README.md. Their GPU/CUDA versions
+# must match the installed PyTorch build.
