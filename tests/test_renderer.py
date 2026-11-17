@@ -69,3 +69,38 @@ def test_bounded_render_rejects_camera_size_mismatch():
     wrong_camera = PinholeCamera(camera.intrinsics, (64, 96))
     with pytest.raises(ValueError, match='image sizes differ'):
         renderer.render_mask(vertices, wrong_camera)
+
+
+@pytest.mark.parametrize('max_render_size', [None, 24])
+def test_depth_is_camera_z_with_infinite_background(max_render_size):
+    camera, vertices, _ = scene()
+    renderer = PyTorch3DSilhouetteRenderer(
+        torch.tensor([[0, 1, 2], [0, 2, 3]]), camera.image_size,
+        device='cpu', max_render_size=max_render_size,
+    )
+    depth = renderer.render_depth(vertices, camera)
+    assert depth.shape == camera.image_size
+    assert depth[13, 24] == pytest.approx(2.0)
+    assert torch.isposinf(depth[0, 0])
+    assert not torch.isnan(depth).any()
+    assert torch.allclose(depth[torch.isfinite(depth)], torch.full_like(depth[torch.isfinite(depth)], 2.0))
+
+
+def test_depth_uses_frontmost_surface_at_each_pixel():
+    camera, vertices, _ = scene()
+    # Two rectangles with the same screen projection but different depths.
+    # Put the far rectangle first so face order cannot mimic visibility.
+    far = vertices * 2
+    faces = torch.tensor([[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7]])
+    renderer = PyTorch3DSilhouetteRenderer(faces, camera.image_size, device='cpu')
+    depth = renderer.render_depth(torch.cat((far, vertices)), camera)
+    assert depth[13, 24] == pytest.approx(2.0)
+    finite = depth[torch.isfinite(depth)]
+    assert finite.numel() > 0 and torch.allclose(finite, torch.full_like(finite, 2.0))
+
+
+def test_depth_rejects_camera_size_mismatch():
+    camera, vertices, renderer = scene()
+    wrong_camera = PinholeCamera(camera.intrinsics, (64, 96))
+    with pytest.raises(ValueError, match='image sizes differ'):
+        renderer.render_depth(vertices, wrong_camera)

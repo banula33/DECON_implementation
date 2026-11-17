@@ -1,3 +1,42 @@
 {
-    "python-envs.defaultEnvManager": "ms-python.python:system"
+    "python-envs.defaultEnvManager": "ms-python.python:system",
+    "ROS2.distro": "jazzy",
+    "python.autoComplete.extraPaths": [
+        "/home/banula/ros2_ws/install/ros2_fundementals_examples/lib/python3.12/site-packages",
+        "/home/banula/ros2_ws/install/gp7_ros2_pkg/lib/python3.12/site-packages",
+        "/home/banula/ros2_ws/src/install/gp7_ros2_pkg/lib/python3.12/site-packages",
+        "/home/banula/Downloads/EN3563-Robotics/build/robot_motion",
+        "/home/banula/Downloads/EN3563-Robotics/install/robot_motion/lib/python3.12/site-packages",
+        "/home/banula/Downloads/EN3563-Robotics/build/monitor",
+        "/home/banula/Downloads/EN3563-Robotics/install/monitor/lib/python3.12/site-packages",
+        "/home/banula/Downloads/EN3563-Robotics/build/robot_kinematics",
+        "/home/banula/Downloads/EN3563-Robotics/install/robot_kinematics/lib/python3.12/site-packages",
+        "/home/banula/Downloads/EN3563-Robotics/install/gp7_ros2_pkg/lib/python3.12/site-packages",
+        "/home/banula/Downloads/EN3563-Robotics/install/control_dashboard/lib/python3.12/site-packages",
+        "/opt/ros/jazzy/opt/gz_sim_vendor/lib/python",
+        "/opt/ros/jazzy/opt/sdformat_vendor/lib/python",
+        "/opt/ros/jazzy/opt/gz_transport_vendor/lib/python",
+        "/opt/ros/jazzy/opt/gz_msgs_vendor/lib/python",
+        "/opt/ros/jazzy/opt/gz_math_vendor/lib/python",
+        "/opt/ros/jazzy/lib/python3.12/site-packages"
+    ],
+    "python.analysis.extraPaths": [
+        "/home/banula/ros2_ws/install/ros2_fundementals_examples/lib/python3.12/site-packages",
+        "/home/banula/ros2_ws/install/gp7_ros2_pkg/lib/python3.12/site-packages",
+        "/home/banula/ros2_ws/src/install/gp7_ros2_pkg/lib/python3.12/site-packages",
+        "/home/banula/Downloads/EN3563-Robotics/build/robot_motion",
+        "/home/banula/Downloads/EN3563-Robotics/install/robot_motion/lib/python3.12/site-packages",
+        "/home/banula/Downloads/EN3563-Robotics/build/monitor",
+        "/home/banula/Downloads/EN3563-Robotics/install/monitor/lib/python3.12/site-packages",
+        "/home/banula/Downloads/EN3563-Robotics/build/robot_kinematics",
+        "/home/banula/Downloads/EN3563-Robotics/install/robot_kinematics/lib/python3.12/site-packages",
+        "/home/banula/Downloads/EN3563-Robotics/install/gp7_ros2_pkg/lib/python3.12/site-packages",
+        "/home/banula/Downloads/EN3563-Robotics/install/control_dashboard/lib/python3.12/site-packages",
+        "/opt/ros/jazzy/opt/gz_sim_vendor/lib/python",
+        "/opt/ros/jazzy/opt/sdformat_vendor/lib/python",
+        "/opt/ros/jazzy/opt/gz_transport_vendor/lib/python",
+        "/opt/ros/jazzy/opt/gz_msgs_vendor/lib/python",
+        "/opt/ros/jazzy/opt/gz_math_vendor/lib/python",
+        "/opt/ros/jazzy/lib/python3.12/site-packages"
+    ]
 }

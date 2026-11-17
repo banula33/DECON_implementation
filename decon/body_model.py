@@ -18,6 +18,10 @@ class SMPLBodyModel:
         ).to(self.device).eval()
         self.model.requires_grad_(False)
         self.faces = torch.as_tensor(self.model.faces.astype("int64"), device=self.device)
+        # Dominant skinning joint gives every SMPL vertex a stable anatomical
+        # region, including wrists/hands, without an extra parsing checkpoint.
+        weights = getattr(self.model, "lbs_weights", None)
+        self.vertex_parts = weights.argmax(dim=-1).detach() if weights is not None else None
 
     def __call__(self, pose: Tensor, shape: Tensor, translation: Tensor) -> Tensor:
         output = self.model(

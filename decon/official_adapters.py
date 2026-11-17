@@ -35,7 +35,11 @@ def _require_path(path: Path, description: str) -> Path:
 
 
 class OfficialSAM2Segmenter:
-    """SAM 2 box-prompt adapter matching the official DECON `sam.py`."""
+    """SAM 2 with scene-aware geometry prompts and optional point corrections.
+
+    ``segment`` retains the original single-box interface. The pipeline uses
+    ``segment_people`` to associate disconnected parts and competing people.
+    """
 
     def __init__(
         self,
@@ -45,12 +49,18 @@ class OfficialSAM2Segmenter:
         checkpoint: str | Path | None = None,
         model_config: str = "configs/sam2.1/sam2.1_hiera_l.yaml",
         device: str = "cuda",
+        guidance: str = "geometry",
+        prompt_corrections: dict | None = None,
     ) -> None:
         self.root = _require_path(Path(segmentation_root).resolve(), "SAM 2 checkout")
         self.model_id = model_id
         self.checkpoint = Path(checkpoint).resolve() if checkpoint else None
         self.model_config = model_config
         self.device = device
+        if guidance not in {"geometry", "box"}:
+            raise ValueError("SAM guidance must be 'geometry' or 'box'")
+        self.guidance = guidance
+        self.prompt_corrections = prompt_corrections or {}
         self._predictor: Any = None
 
     def _load(self) -> Any:
@@ -79,6 +89,84 @@ class OfficialSAM2Segmenter:
             predictor.set_image(rgb)
             masks, _, _ = predictor.predict(box=box, multimask_output=False)
         return torch.from_numpy(np.asarray(masks[0], dtype=np.bool_))
+
+    def segment_people(self, image, estimates, bounding_boxes, *, renderer, vertex_parts=None):
+        from .segmentation import (exclusive_masks, geometry_points, person_prompts,
+                                   validate_corrections, visible_geometry)
+
+        rgb = np.array(load_rgb(image), copy=True)
+        image_size = rgb.shape[:2]
+        if len(estimates) != len(bounding_boxes):
+            raise ValueError("Each person needs a segmentation bounding box")
+        if not estimates:
+            return []
+        corrections = validate_corrections(self.prompt_corrections, len(estimates), image_size)
+        depths = None
+        automatic = [np.empty((0, 2), dtype=np.float32) for _ in estimates]
+        if self.guidance == "geometry":
+            if not callable(getattr(renderer, "render_depth", None)):
+                raise ValueError("Geometry-guided SAM requires a renderer with render_depth; use guidance='box' otherwise")
+            with torch.no_grad():
+                depths = [renderer.render_depth(p.vertices, p.camera).detach().cpu().numpy()
+                          for p in estimates]
+            if any(d.shape != image_size or np.isnan(d).any() or (d <= 0).any() for d in depths):
+                raise ValueError("Depth maps must retain image resolution with positive depth or +inf background")
+            visible = visible_geometry(depths)
+            automatic = [geometry_points(p, d, v, vertex_parts)
+                         for p, d, v in zip(estimates, depths, visible)]
+
+        predictor = self._load()
+        threshold = float(getattr(predictor, "mask_threshold", 0.0))
+        predictions, diagnostics = [], []
+        with torch.inference_mode():
+            # SAM image encoding is the expensive step: share it across people.
+            predictor.set_image(rgb)
+            for i, box_tensor in enumerate(bounding_boxes):
+                box = box_tensor.detach().cpu().numpy().astype(np.float32).copy()
+                points, labels, sources = person_prompts(i, automatic, corrections)
+                positive = points[labels == 1]
+                if len(positive):
+                    # Corrections can recover fingers outside the estimated box.
+                    box[:2] = np.minimum(box[:2], np.maximum(positive.min(0) - 2, 0))
+                    box[2:] = np.maximum(box[2:], np.minimum(positive.max(0) + 2,
+                                                           [rgb.shape[1] - 1, rgb.shape[0] - 1]))
+                raw, quality, low_res = predictor.predict(box=box, multimask_output=False, return_logits=True)
+                baseline = self._mask_logits(raw, image_size)
+                score = baseline
+                if len(points):
+                    raw, quality, _ = predictor.predict(
+                        box=box, point_coords=points, point_labels=labels,
+                        mask_input=np.asarray(low_res, dtype=np.float32)[:1],
+                        multimask_output=False, return_logits=True,
+                    )
+                    score = self._mask_logits(raw, image_size)
+                predictions.append(score)
+                diagnostics.append({
+                    "guidance": self.guidance,
+                    "box": box.tolist(),
+                    "points": [{"xy": point.tolist(), "label": int(label), "source": source}
+                               for point, label, source in zip(points, labels, sources)],
+                    "sam_quality": float(np.asarray(quality).reshape(-1)[0]),
+                    "baseline_pixels": int((baseline > threshold).sum()),
+                    "added_pixels_before_ownership": int(((score > threshold) & (baseline <= threshold)).sum()),
+                    "removed_pixels_before_ownership": int(((score <= threshold) & (baseline > threshold)).sum()),
+                })
+        masks = exclusive_masks(predictions, depths, threshold, corrections)
+        for estimate, score, mask, info in zip(estimates, predictions, masks, diagnostics):
+            info["overlap_pixels_removed"] = int(((score > threshold) & ~mask).sum())
+            info["unmet_points"] = [p for p in info["points"]
+                                    if bool(mask[int(round(p["xy"][1])), int(round(p["xy"][0]))]) != bool(p["label"])]
+            info["needs_review"] = bool(info["unmet_points"] or info["overlap_pixels_removed"]
+                                        or not any(p["label"] for p in info["points"]))
+            estimate.metadata = {**(estimate.metadata or {}), "segmentation": info}
+        return [torch.from_numpy(mask) for mask in masks]
+
+    @staticmethod
+    def _mask_logits(raw, image_size):
+        score = np.asarray(raw, dtype=np.float32)
+        if score.shape != (1, *image_size) or not np.isfinite(score).all():
+            raise ValueError("SAM must return one finite original-resolution mask logit map")
+        return score[0]
 
 
 class OfficialPowerPaintInpainter:
@@ -155,7 +243,7 @@ class OfficialPowerPaintInpainter:
 
 
 class PyTorch3DSilhouetteRenderer:
-    """Differentiable PyTorch3D silhouette renderer for GGDO."""
+    """Differentiable silhouettes and hard surface depths in the same camera."""
 
     def __init__(self, faces: Tensor, image_size: tuple[int, int], device: str = "cuda",
                  max_render_size: int | None = 1024) -> None:
@@ -178,10 +266,15 @@ class PyTorch3DSilhouetteRenderer:
                 perspective_correct=True
             )
         )
+        self.depth_rasterizer = MeshRasterizer(
+            raster_settings=RasterizationSettings(
+                image_size=self.raster_size, blur_radius=0.0, faces_per_pixel=1,
+                perspective_correct=True,
+            )
+        )
         self.shader = SoftSilhouetteShader(blend_params=BlendParams(sigma=1e-4, gamma=1e-4))
 
-    def render_mask(self, vertices: Tensor, camera: Any) -> Tensor:
-        from pytorch3d.structures import Meshes
+    def _raster_camera(self, camera: Any) -> Any:
         if isinstance(camera, PinholeCamera):
             if camera.image_size != self.image_size:
                 raise ValueError("Camera and renderer image sizes differ")
@@ -190,6 +283,11 @@ class PyTorch3DSilhouetteRenderer:
             camera = camera.to_pytorch3d(self.device)
         elif self.raster_size != self.image_size:
             raise ValueError("Bounded rendering requires a PinholeCamera; use max_render_size=None for other cameras")
+        return camera
+
+    def render_mask(self, vertices: Tensor, camera: Any) -> Tensor:
+        from pytorch3d.structures import Meshes
+        camera = self._raster_camera(camera)
         meshes = Meshes(verts=[vertices.to(self.device)], faces=[self.faces])
         fragments = self.rasterizer(meshes, cameras=camera)
         image = self.shader(fragments, meshes)[..., 3]
@@ -199,6 +297,34 @@ class PyTorch3DSilhouetteRenderer:
                 mask[None, None], size=self.image_size, mode="bilinear", align_corners=False,
             )[0, 0]
         return mask
+
+    def render_depth(self, vertices: Tensor, camera: Any) -> Tensor:
+        """Return frontmost camera-space z at native resolution, +inf outside.
+
+        PyTorch3D's mesh rasterizer retains view-space z rather than projected
+        z. With our OpenCV camera conversion this is the original positive z
+        coordinate. Nearest resizing preserves depth discontinuities and avoids
+        blending infinite background values into valid surface depths.
+        """
+        from pytorch3d.structures import Meshes
+
+        camera = self._raster_camera(camera)
+        meshes = Meshes(verts=[vertices.to(self.device)], faces=[self.faces])
+        fragments = self.depth_rasterizer(meshes, cameras=camera)
+        depth = fragments.zbuf[0, ..., 0]
+        foreground = fragments.pix_to_face[0, ..., 0] >= 0
+        # Resize finite buffers separately, then restore +inf for background.
+        # This also prevents invalid fragment padding (-1) escaping to callers.
+        depth = torch.where(foreground, depth, torch.zeros_like(depth))
+        if self.raster_size != self.image_size:
+            depth = torch.nn.functional.interpolate(
+                depth[None, None], size=self.image_size, mode="nearest",
+            )[0, 0]
+            foreground = torch.nn.functional.interpolate(
+                foreground[None, None].to(depth.dtype), size=self.image_size,
+                mode="nearest",
+            )[0, 0].bool()
+        return depth.masked_fill(~foreground, float("inf"))
 
 
 class OfficialSATHMRGeometryEstimator:
