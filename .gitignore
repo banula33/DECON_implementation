@@ -1,0 +1,8 @@
+.venv/
+.venv-gpu/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+outputs/
+checkpoints/
+vendor/

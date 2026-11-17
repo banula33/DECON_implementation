@@ -6,11 +6,11 @@ therefore be imported without SAM 2, PowerPaint, PyTorch3D, or SAT-HMR.
 
 from __future__ import annotations
 
-import json
 import os
-import shutil
+import importlib.util
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +20,8 @@ from PIL import Image
 from torch import Tensor
 
 from .types import HumanEstimate
+from .camera import PinholeCamera
+from .images import isolate, load_rgb, mask_image
 
 
 class OfficialDependencyError(RuntimeError):
@@ -40,9 +42,15 @@ class OfficialSAM2Segmenter:
         segmentation_root: str | Path,
         *,
         model_id: str = "facebook/sam2.1-hiera-large",
+        checkpoint: str | Path | None = None,
+        model_config: str = "configs/sam2.1/sam2.1_hiera_l.yaml",
+        device: str = "cuda",
     ) -> None:
-        self.root = _require_path(Path(segmentation_root), "SAM 2 checkout")
+        self.root = _require_path(Path(segmentation_root).resolve(), "SAM 2 checkout")
         self.model_id = model_id
+        self.checkpoint = Path(checkpoint).resolve() if checkpoint else None
+        self.model_config = model_config
+        self.device = device
         self._predictor: Any = None
 
     def _load(self) -> Any:
@@ -55,15 +63,20 @@ class OfficialSAM2Segmenter:
                     "Install the official SAM 2 dependencies from "
                     f"{self.root / 'INSTALL.md'}"
                 ) from exc
-            self._predictor = SAM2ImagePredictor.from_pretrained(self.model_id)
+            if self.checkpoint is not None:
+                from sam2.build_sam import build_sam2
+                _require_path(self.checkpoint, "SAM 2 checkpoint")
+                self._predictor = SAM2ImagePredictor(build_sam2(self.model_config, str(self.checkpoint), device=self.device))
+            else:
+                self._predictor = SAM2ImagePredictor.from_pretrained(self.model_id, device=self.device)
         return self._predictor
 
     def segment(self, image: Any, bounding_box: Tensor) -> Tensor:
         predictor = self._load()
-        rgb = np.asarray(image.convert("RGB") if isinstance(image, Image.Image) else image)
+        rgb = np.asarray(load_rgb(image))
         box = bounding_box.detach().cpu().numpy().astype(np.float32)
-        predictor.set_image(rgb)
         with torch.inference_mode():
+            predictor.set_image(rgb)
             masks, _, _ = predictor.predict(box=box, multimask_output=False)
         return torch.from_numpy(np.asarray(masks[0], dtype=np.bool_))
 
@@ -85,8 +98,8 @@ class OfficialPowerPaintInpainter:
         version: str = "ppt-v2",
         local_files_only: bool = True,
     ) -> None:
-        self.root = _require_path(Path(inpainting_root), "PowerPaint checkout")
-        self.checkpoint_dir = _require_path(Path(checkpoint_dir), "PowerPaint checkpoint")
+        self.root = _require_path(Path(inpainting_root).resolve(), "PowerPaint checkout")
+        self.checkpoint_dir = _require_path(Path(checkpoint_dir).resolve(), "PowerPaint checkpoint")
         self.settings = (prompt, negative_prompt, fitting_degree, ddim_steps, scale, seed, version, local_files_only)
         self._controller: Any = None
 
@@ -98,7 +111,11 @@ class OfficialPowerPaintInpainter:
                 )
             sys.path.insert(0, str(self.root))
             try:
-                from app import PowerPaintController
+                app_path = _require_path(self.root / "app.py", "PowerPaint app.py")
+                spec = importlib.util.spec_from_file_location("decon_powerpaint_app", app_path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                PowerPaintController = module.PowerPaintController
             except ImportError as exc:
                 raise OfficialDependencyError(
                     "Install PowerPaint dependencies from "
@@ -112,16 +129,26 @@ class OfficialPowerPaintInpainter:
         return self._controller
 
     def inpaint(self, image: Any, human_mask: Tensor, completion_mask: Tensor) -> Image.Image:
+        pil_image = load_rgb(image)
+        human_mask = human_mask.detach().cpu().bool()
+        completion_mask = completion_mask.detach().cpu().bool()
+        if completion_mask.shape != human_mask.shape:
+            raise ValueError("Human and completion masks must have the same shape")
+        completion_mask = completion_mask & ~human_mask
+        isolated = isolate(pil_image, human_mask)
+        if not completion_mask.any():
+            return isolated
         controller = self._load()
         prompt, negative, fitting, steps, scale, seed, _, _ = self.settings
-        pil_image = image.convert("RGB") if isinstance(image, Image.Image) else Image.fromarray(np.asarray(image)).convert("RGB")
-        mask = (completion_mask.detach().cpu().numpy().astype(np.uint8) * 255)
-        input_image = {"image": pil_image, "mask": Image.fromarray(mask, mode="L")}
+        # PowerPaint v2 multiplies a HxWx3 image by its mask; it needs RGB.
+        input_image = {"image": isolated, "mask": mask_image(completion_mask).convert("RGB")}
         outputs, _ = controller.predict(
             input_image, prompt, fitting, steps, scale, seed, negative,
             "text-guided", None, None,
         )
-        return outputs[0]
+        generated = outputs[0].convert("RGB").resize(pil_image.size, Image.Resampling.LANCZOS)
+        # Preserve visible pixels exactly and keep all other subjects/background out.
+        return Image.composite(generated, isolated, mask_image(completion_mask))
 
 
 class PyTorch3DSilhouetteRenderer:
@@ -134,17 +161,23 @@ class PyTorch3DSilhouetteRenderer:
             )
         except ImportError as exc:
             raise OfficialDependencyError("Install PyTorch3D for differentiable rendering") from exc
+        self.image_size = image_size
         self.faces = faces.to(device=device, dtype=torch.int64)
         self.device = torch.device(device)
         self.rasterizer = MeshRasterizer(
             raster_settings=RasterizationSettings(
-                image_size=image_size, blur_radius=np.log(1.0 / 1e-4 - 1.0) * 1.5, faces_per_pixel=50
+                image_size=image_size, blur_radius=np.log(1.0 / 1e-4 - 1.0) * 1e-4, faces_per_pixel=50,
+                perspective_correct=True
             )
         )
         self.shader = SoftSilhouetteShader(blend_params=BlendParams(sigma=1e-4, gamma=1e-4))
 
     def render_mask(self, vertices: Tensor, camera: Any) -> Tensor:
         from pytorch3d.structures import Meshes
+        if isinstance(camera, PinholeCamera):
+            if camera.image_size != self.image_size:
+                raise ValueError("Camera and renderer image sizes differ")
+            camera = camera.to_pytorch3d(self.device)
         meshes = Meshes(verts=[vertices.to(self.device)], faces=[self.faces])
         fragments = self.rasterizer(meshes, cameras=camera)
         image = self.shader(fragments, meshes)[..., 3]
@@ -152,51 +185,55 @@ class PyTorch3DSilhouetteRenderer:
 
 
 class OfficialSATHMRGeometryEstimator:
-    """Run official SAT-HMR inference and read its JSON/OBJ artifacts.
+    """Run SAT-HMR in an isolated subprocess and retain native camera coordinates.
 
-    The official SAT-HMR CLI expects an input directory and writes one JSON
-    parameter file plus one OBJ per detected person. This adapter preserves
-    that contract while returning the project's `HumanEstimate` objects.
+    No demo inputs/results in the official checkout are overwritten. A separate
+    Python executable can isolate SAT-HMR's dependencies from the other models.
     """
 
-    def __init__(self, sat_hmr_root: str | Path, *, python_executable: str | None = None) -> None:
-        self.root = _require_path(Path(sat_hmr_root), "SAT-HMR checkout")
+    def __init__(self, sat_hmr_root: str | Path, *, python_executable: str | None = None,
+                 device: str = "cuda", threshold: float = 0.3, config: str = "demo") -> None:
+        self.root = _require_path(Path(sat_hmr_root).resolve(), "SAT-HMR checkout")
+        _require_path(self.root / "main.py", "SAT-HMR main.py")
         self.python = python_executable or sys.executable
-        self.main = _require_path(self.root / "main.py", "SAT-HMR main.py")
+        self.device = torch.device(device)
+        if not 0 < threshold < 1:
+            raise ValueError("SAT-HMR threshold must be between 0 and 1")
+        self.threshold = threshold
+        self.config = config
 
     def estimate(self, image: Any) -> list[HumanEstimate]:
-        image_path = Path(image) if isinstance(image, (str, Path)) else None
-        if image_path is None:
-            raise TypeError("OfficialSATHMRGeometryEstimator.estimate requires an image path")
-        input_dir = self.root / "demo"
-        output_dir = self.root / "demo_results"
-        input_dir.mkdir(exist_ok=True)
-        if output_dir.exists():
-            shutil.rmtree(output_dir)
-        output_dir.mkdir()
-        copied = input_dir / image_path.name
-        shutil.copy2(image_path, copied)
-        env = os.environ.copy()
-        subprocess.run(
-            [self.python, str(self.main), "--cfg", "demo", "--mode", "infer"],
-            cwd=self.root, env=env, check=True,
-        )
-        estimates: list[HumanEstimate] = []
-        for params_path in sorted(output_dir.glob("*_smpl_para.json")):
-            params = json.loads(params_path.read_text())
-            mesh_path = params_path.with_name(params_path.name.replace("_smpl_para.json", "_smpl_mesh.obj"))
-            try:
-                import trimesh
-                vertices = torch.from_numpy(np.asarray(trimesh.load(mesh_path, process=False).vertices)).float()
-            except (ImportError, FileNotFoundError) as exc:
-                raise OfficialDependencyError(
-                    f"SAT-HMR mesh artifact missing or trimesh unavailable: {mesh_path}"
-                ) from exc
-            with Image.open(image_path) as pil_image:
-                mask = torch.zeros((pil_image.height, pil_image.width), dtype=torch.bool)
-            estimates.append(HumanEstimate(
-                vertices=vertices, mask=mask, camera=params,
-                pose=torch.tensor(params["poses"]), shape=torch.tensor(params["betas"]),
-                translation=torch.tensor(params["transl"]), metadata={"source": str(params_path)},
-            ))
+        rgb = load_rgb(image)
+        with tempfile.TemporaryDirectory(prefix="decon-sat-") as work:
+            work = Path(work)
+            inputs, outputs = work / "inputs", work / "outputs"
+            inputs.mkdir()
+            outputs.mkdir()
+            rgb.save(inputs / "input.png")
+            runner = Path(__file__).with_name("sat_hmr_runner.py")
+            subprocess.run(
+                [self.python, "-c",
+                 "import runpy, sys; runpy.run_path(sys.argv.pop(1), run_name='__main__')",
+                 str(runner), "--input-dir", str(inputs),
+                 "--output-dir", str(outputs), "--threshold", str(self.threshold),
+                 "--config", self.config],
+                cwd=self.root, env=os.environ.copy(), check=True,
+            )
+            return self.read_predictions(outputs, (rgb.height, rgb.width))
+
+    def read_predictions(self, output_dir: Path, image_size: tuple[int, int]) -> list[HumanEstimate]:
+        estimates = []
+        for path in sorted(output_dir.glob("person_*.npz")):
+            with np.load(path, allow_pickle=False) as data:
+                def tensor(key):
+                    return torch.as_tensor(data[key].copy(), device=self.device, dtype=torch.float32)
+                camera = PinholeCamera.from_resized(
+                    tensor("intrinsics"), tuple(int(x) for x in data["resized_size"]), image_size,
+                )
+                estimates.append(HumanEstimate(
+                    vertices=tensor("vertices"), mask=torch.zeros(image_size, dtype=torch.bool, device=self.device),
+                    camera=camera, pose=tensor("pose"), shape=tensor("shape"),
+                    translation=tensor("translation"),
+                    metadata={"person_id": path.stem, "coordinate_system": "opencv_camera"},
+                ))
         return estimates

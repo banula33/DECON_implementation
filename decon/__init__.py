@@ -1,5 +1,7 @@
 """Building blocks for the DECON human-decoupling stage."""
 
+from .camera import PinholeCamera
+from .body_model import SMPLBodyModel
 from .ggdo import GGDOConfig, GGDOResult, optimize_geometry
 from .official_adapters import (
 	OfficialDependencyError,
@@ -13,6 +15,8 @@ from .preflight import format_preflight, inspect_official_setup
 from .types import DecoupledPerson, HumanEstimate
 
 __all__ = [
+    "PinholeCamera",
+    "SMPLBodyModel",
 	"DecoupledPerson",
 	"GGDOConfig",
 	"GGDOResult",

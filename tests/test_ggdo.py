@@ -1,36 +1,73 @@
+import pytest
 import torch
 
 from decon.ggdo import GGDOConfig, optimize_geometry
 
 
-def gaussian_renderer(vertices: torch.Tensor) -> torch.Tensor:
-    height, width = 24, 24
-    y, x = torch.meshgrid(
-        torch.arange(height, dtype=vertices.dtype),
-        torch.arange(width, dtype=vertices.dtype),
-        indexing="ij",
-    )
-    center = vertices[:, :2].mean(dim=0)
-    distance = (x - center[0]) ** 2 + (y - center[1]) ** 2
-    return torch.exp(-distance / 8.0)
+def gaussian_renderer(vertices):
+    y, x = torch.meshgrid(torch.arange(24), torch.arange(24), indexing='ij')
+    center = vertices[:, :2].mean(0)
+    spread = (vertices[1, 0] - vertices[0, 0]).square() + 2
+    return torch.exp(-((x - center[0]) ** 2 + (y - center[1]) ** 2) / spread)
+
+
+def body(pose, shape, translation):
+    width = 1 + shape[0]
+    tilt = pose.reshape(-1)[0]
+    zero = width * 0
+    return torch.stack([torch.stack([-width, -tilt, zero]), torch.stack([width, tilt, zero])]) + translation
 
 
 def test_translation_stage_reduces_mask_error():
-    vertices = torch.tensor([[5.0, 8.0, 0.0], [7.0, 8.0, 0.0]])
-    target_vertices = vertices + torch.tensor([6.0, 3.0, 0.0])
-    target_mask = gaussian_renderer(target_vertices)
-    segmented_mask = target_mask > 0.2
-    initial_loss = torch.mean(
-        (gaussian_renderer(vertices) - segmented_mask.float()) ** 2
-    )
+    vertices = torch.tensor([[5., 8., 0.], [7., 8., 0.]])
+    target = gaussian_renderer(vertices + torch.tensor([2., 1., 0.]))
+    result = optimize_geometry(vertices, target, gaussian_renderer,
+                               config=GGDOConfig(translation_steps=100, pose_shape_steps=0, translation_lr=0.05))
+    assert result.losses[-1] < result.losses[0] * 0.05
+    assert torch.allclose(result.vertices[1] - result.vertices[0], vertices[1] - vertices[0])
 
-    result = optimize_geometry(
-        vertices,
-        segmented_mask,
-        gaussian_renderer,
-        config=GGDOConfig(translation_steps=80, pose_shape_steps=20),
-    )
 
-    assert result.vertices.shape == vertices.shape
-    assert result.geometry_mask.shape == target_mask.shape
-    assert result.losses[-1] < float(initial_loss)
+def test_pose_shape_stage_uses_body_model_and_preserves_inputs():
+    pose, shape, trans = torch.zeros(24, 3), torch.zeros(10), torch.tensor([12., 12., 0.])
+    original_shape = shape.clone()
+    target_shape = shape.clone()
+    target_shape[0] = 0.8
+    vertices = body(pose, shape, trans)
+    target = gaussian_renderer(body(pose, target_shape, trans))
+    result = optimize_geometry(vertices, target, gaussian_renderer, body_model=body,
+                               pose=pose, shape=shape, translation=trans,
+                               config=GGDOConfig(translation_steps=0, pose_shape_steps=100, pose_shape_lr=0.03))
+    assert result.losses[-1] < result.losses[0] * 0.01
+    assert result.shape[0] > 0.7
+    assert torch.equal(shape, original_shape)
+    assert torch.allclose(result.vertices, body(result.pose, result.shape, result.translation))
+    assert not result.vertices.requires_grad
+
+
+def test_stage_one_freezes_pose_and_shape():
+    pose, shape, trans = torch.zeros(24, 3), torch.zeros(10), torch.tensor([12., 12., 0.])
+    vertices = body(pose, shape, trans)
+    result = optimize_geometry(vertices, gaussian_renderer(vertices + 0.2), gaussian_renderer,
+                               body_model=body, pose=pose, shape=shape, translation=trans,
+                               config=GGDOConfig(translation_steps=10, pose_shape_steps=0))
+    assert torch.equal(result.pose, pose)
+    assert torch.equal(result.shape, shape)
+    assert not torch.equal(result.translation, trans)
+
+
+def test_requires_parametric_model_for_second_stage():
+    with pytest.raises(ValueError, match='body_model'):
+        optimize_geometry(torch.ones(2, 3), torch.ones(24, 24), gaussian_renderer)
+
+
+@pytest.mark.parametrize('mask', [torch.zeros(24, 24), torch.full((24, 24), float('nan'))])
+def test_invalid_masks_fail_early(mask):
+    with pytest.raises(ValueError, match='segmented_mask'):
+        optimize_geometry(torch.ones(2, 3), mask, gaussian_renderer)
+
+
+def test_rejects_mismatched_coordinate_frames():
+    pose, shape, trans = torch.zeros(24, 3), torch.zeros(10), torch.tensor([12., 12., 0.])
+    with pytest.raises(ValueError, match='reproduce'):
+        optimize_geometry(body(pose, shape, trans) + 1, torch.ones(24, 24), gaussian_renderer,
+                          body_model=body, pose=pose, shape=shape, translation=trans)

@@ -3,7 +3,6 @@
 from dataclasses import dataclass
 from typing import Any, Optional
 
-import torch
 from torch import Tensor
 
 
@@ -38,3 +37,9 @@ class DecoupledPerson:
     completion_mask: Tensor
     image: Optional[Any] = None
     losses: Optional[list[float]] = None
+    segmented_image: Optional[Any] = None
+    initial_geometry_mask: Optional[Tensor] = None
+    bounding_box: Optional[Tensor] = None
+    optimized_pose: Optional[Tensor] = None
+    optimized_shape: Optional[Tensor] = None
+    optimized_translation: Optional[Tensor] = None

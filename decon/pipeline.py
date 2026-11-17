@@ -1,24 +1,21 @@
-"""Human decoupling orchestration: estimate, segment, GGDO, and inpaint."""
+"""Original-resolution human decoupling with SMPL-guided completion."""
 
-from pathlib import Path
 from typing import Any
 
 import torch
 from torch import Tensor
 
 from .adapters import BoundingBoxer, GeometryEstimator, Inpainter, MeshRenderer, Segmenter
-from .ggdo import GGDOConfig, optimize_geometry
+from .ggdo import BodyModel, GGDOConfig, optimize_geometry
+from .images import isolate, load_rgb
 from .types import DecoupledPerson
 
 
 class HumanDecouplingPipeline:
     def __init__(
-        self,
-        geometry_estimator: GeometryEstimator,
-        segmenter: Segmenter,
-        renderer: MeshRenderer,
-        inpainter: Inpainter | None = None,
-        *,
+        self, geometry_estimator: GeometryEstimator, segmenter: Segmenter,
+        renderer: MeshRenderer, inpainter: Inpainter | None = None, *,
+        body_model: BodyModel | None = None,
         bbox_for_person: BoundingBoxer | None = None,
         ggdo_config: GGDOConfig | None = None,
     ) -> None:
@@ -26,41 +23,45 @@ class HumanDecouplingPipeline:
         self.segmenter = segmenter
         self.renderer = renderer
         self.inpainter = inpainter
+        self.body_model = body_model
         self.bbox_for_person = bbox_for_person or self._default_bbox
         self.ggdo_config = ggdo_config or GGDOConfig()
 
     def run(self, image: Any) -> list[DecoupledPerson]:
-        results: list[DecoupledPerson] = []
-        for estimate in self.geometry_estimator.estimate(image):
+        rgb = load_rgb(image)
+        results = []
+        for estimate in self.geometry_estimator.estimate(rgb):
             box = self.bbox_for_person(estimate.vertices, estimate.camera)
-            segmented_mask = self.segmenter.segment(image, box).bool()
+            mask = self.segmenter.segment(rgb, box).to(device=estimate.vertices.device, dtype=torch.bool)
+            if tuple(mask.shape) != (rgb.height, rgb.width):
+                raise ValueError("Segmentation must retain the original image resolution")
+            if not mask.any():
+                raise ValueError("SAM returned an empty person mask")
+            estimate.mask = mask
             render = lambda vertices: self.renderer.render_mask(vertices, estimate.camera)
+            initial_mask = render(estimate.vertices).detach()
             ggdo = optimize_geometry(
-                estimate.vertices,
-                segmented_mask,
-                render,
+                estimate.vertices, mask, render, body_model=self.body_model,
+                pose=estimate.pose, shape=estimate.shape, translation=estimate.translation,
                 config=self.ggdo_config,
             )
-            completion_mask = (ggdo.geometry_mask > 0.5) & ~segmented_mask
-            completed_image = None
+            completion = (ggdo.geometry_mask > 0.5) & ~mask
+            segmented_image = isolate(rgb, mask)
+            completed = None
             if self.inpainter is not None:
-                completed_image = self.inpainter.inpaint(
-                    image, segmented_mask, completion_mask
-                )
-            results.append(
-                DecoupledPerson(
-                    estimate=estimate,
-                    optimized_vertices=ggdo.vertices,
-                    geometry_mask=ggdo.geometry_mask,
-                    completion_mask=completion_mask,
-                    image=completed_image,
-                    losses=ggdo.losses,
-                )
-            )
+                completed = self.inpainter.inpaint(segmented_image, mask, completion)
+            results.append(DecoupledPerson(
+                estimate=estimate, optimized_vertices=ggdo.vertices,
+                geometry_mask=ggdo.geometry_mask, completion_mask=completion,
+                image=completed, losses=ggdo.losses, segmented_image=segmented_image,
+                initial_geometry_mask=initial_mask, bounding_box=box,
+                optimized_pose=ggdo.pose, optimized_shape=ggdo.shape,
+                optimized_translation=ggdo.translation,
+            ))
+        if not results:
+            raise ValueError("SAT-HMR detected no people in the input image")
         return results
 
     @staticmethod
     def _default_bbox(vertices: Tensor, camera: Any) -> Tensor:
-        del camera
-        xy = vertices[:, :2]
-        return torch.stack((xy[:, 0].min(), xy[:, 1].min(), xy[:, 0].max(), xy[:, 1].max()))
+        return camera.bounding_box(vertices)

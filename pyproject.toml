@@ -5,7 +5,19 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "decon-implementation"
 version = "0.1.0"
-dependencies = ["torch>=2.2"]
+requires-python = ">=3.10"
+dependencies = ["torch>=2.2", "numpy", "Pillow"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+official = ["smplx", "PyYAML"]
+
+[project.scripts]
+decon-decouple = "decon.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["decon*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+testpaths = ["tests"]
