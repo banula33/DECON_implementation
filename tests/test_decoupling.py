@@ -237,3 +237,24 @@ class Engine:
     assert torch.equal(people[0].translation, torch.tensor([0., 0., 3.]))
     assert people[0].camera.image_size == (40, 20)
     assert people[0].camera.intrinsics[0, 0] == 20
+
+
+@pytest.mark.parametrize('enabled', [True, False])
+def test_powerpaint_import_preserves_caller_gradient_mode(tmp_path, monkeypatch, enabled):
+    # The real upstream app has this process-wide side effect on import.
+    (tmp_path / 'app.py').write_text(
+        'import torch\n'
+        'torch.set_grad_enabled(False)\n'
+        'class PowerPaintController:\n'
+        '    def __init__(self, *args): pass\n'
+    )
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    adapter = OfficialPowerPaintInpainter(tmp_path, tmp_path)
+    with torch.set_grad_enabled(enabled):
+        adapter._load()
+        assert torch.is_grad_enabled() is enabled
+        if enabled:
+            value = torch.tensor(2., requires_grad=True)
+            value.square().backward()
+            assert value.grad == 4.

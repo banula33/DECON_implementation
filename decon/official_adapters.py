@@ -73,7 +73,7 @@ class OfficialSAM2Segmenter:
 
     def segment(self, image: Any, bounding_box: Tensor) -> Tensor:
         predictor = self._load()
-        rgb = np.asarray(load_rgb(image))
+        rgb = np.array(load_rgb(image), copy=True)
         box = bounding_box.detach().cpu().numpy().astype(np.float32)
         with torch.inference_mode():
             predictor.set_image(rgb)
@@ -114,7 +114,10 @@ class OfficialPowerPaintInpainter:
                 app_path = _require_path(self.root / "app.py", "PowerPaint app.py")
                 spec = importlib.util.spec_from_file_location("decon_powerpaint_app", app_path)
                 module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
+                # Upstream app.py disables gradients at import time. Restore
+                # the caller's state so GGDO can fit subsequent people.
+                with torch.set_grad_enabled(torch.is_grad_enabled()):
+                    spec.loader.exec_module(module)
                 PowerPaintController = module.PowerPaintController
             except ImportError as exc:
                 raise OfficialDependencyError(
@@ -154,7 +157,8 @@ class OfficialPowerPaintInpainter:
 class PyTorch3DSilhouetteRenderer:
     """Differentiable PyTorch3D silhouette renderer for GGDO."""
 
-    def __init__(self, faces: Tensor, image_size: tuple[int, int], device: str = "cuda") -> None:
+    def __init__(self, faces: Tensor, image_size: tuple[int, int], device: str = "cuda",
+                 max_render_size: int | None = 1024) -> None:
         try:
             from pytorch3d.renderer import (
                 BlendParams, MeshRasterizer, RasterizationSettings, SoftSilhouetteShader,
@@ -162,11 +166,15 @@ class PyTorch3DSilhouetteRenderer:
         except ImportError as exc:
             raise OfficialDependencyError("Install PyTorch3D for differentiable rendering") from exc
         self.image_size = image_size
+        if max_render_size is not None and max_render_size <= 0:
+            raise ValueError("max_render_size must be positive or None")
+        scale = min(1.0, max_render_size / max(image_size)) if max_render_size else 1.0
+        self.raster_size = tuple(max(1, round(size * scale)) for size in image_size)
         self.faces = faces.to(device=device, dtype=torch.int64)
         self.device = torch.device(device)
         self.rasterizer = MeshRasterizer(
             raster_settings=RasterizationSettings(
-                image_size=image_size, blur_radius=np.log(1.0 / 1e-4 - 1.0) * 1e-4, faces_per_pixel=50,
+                image_size=self.raster_size, blur_radius=np.log(1.0 / 1e-4 - 1.0) * 1e-4, faces_per_pixel=50,
                 perspective_correct=True
             )
         )
@@ -177,11 +185,20 @@ class PyTorch3DSilhouetteRenderer:
         if isinstance(camera, PinholeCamera):
             if camera.image_size != self.image_size:
                 raise ValueError("Camera and renderer image sizes differ")
+            if self.raster_size != self.image_size:
+                camera = PinholeCamera.from_resized(camera.intrinsics, camera.image_size, self.raster_size)
             camera = camera.to_pytorch3d(self.device)
+        elif self.raster_size != self.image_size:
+            raise ValueError("Bounded rendering requires a PinholeCamera; use max_render_size=None for other cameras")
         meshes = Meshes(verts=[vertices.to(self.device)], faces=[self.faces])
         fragments = self.rasterizer(meshes, cameras=camera)
         image = self.shader(fragments, meshes)[..., 3]
-        return image[0]
+        mask = image[0]
+        if self.raster_size != self.image_size:
+            mask = torch.nn.functional.interpolate(
+                mask[None, None], size=self.image_size, mode="bilinear", align_corners=False,
+            )[0, 0]
+        return mask
 
 
 class OfficialSATHMRGeometryEstimator:

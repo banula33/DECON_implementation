@@ -21,7 +21,11 @@ def main(argv=None):
     parser.add_argument('--allow-model-downloads', action='store_true', help='Allow PowerPaint to download base models')
     parser.add_argument('--translation-steps', type=int, default=100)
     parser.add_argument('--pose-shape-steps', type=int, default=300)
+    parser.add_argument('--render-max-edge', type=int, default=1024,
+                        help='Maximum rasterization edge; masks retain input resolution (0 uses native resolution)')
     args = parser.parse_args(argv)
+    if args.render_max_edge < 0:
+        parser.error('--render-max-edge must be nonnegative')
 
     import torch
     from .artifacts import save_results
@@ -43,7 +47,8 @@ def main(argv=None):
     pipeline = HumanDecouplingPipeline(
         OfficialSATHMRGeometryEstimator(sat_root, python_executable=args.sat_python, config=args.sat_config, threshold=args.sat_threshold),
         OfficialSAM2Segmenter(root / 'Img_Segmentation', checkpoint=args.sam_checkpoint, model_config=args.sam_config),
-        PyTorch3DSilhouetteRenderer(body.faces, (rgb.height, rgb.width)),
+        PyTorch3DSilhouetteRenderer(body.faces, (rgb.height, rgb.width),
+                                   max_render_size=args.render_max_edge or None),
         OfficialPowerPaintInpainter(root / 'Img_Inpainting', args.powerpaint_checkpoint,
                                    local_files_only=not args.allow_model_downloads),
         body_model=body,

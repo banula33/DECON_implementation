@@ -11,7 +11,7 @@ NeuS reconstruction, and PAPO are not implemented here.
 ## Status and validation
 
 The pipeline, adapters, command-line runner, and result export are implemented.
-The local suite passes **21 tests**, including real PyTorch3D camera projection,
+The local suite passes **25 tests**, including real PyTorch3D camera projection,
 silhouette gradients, and translation fitting on CPU. Tests also cover parametric
 optimization, a SAT-HMR subprocess bridge, image isolation, and two-person
 orchestration. Foundation-model outputs and body geometry are synthetic fixtures;
@@ -84,6 +84,21 @@ The helper only arranges files; it does not acquire licensed models or the
 additional support arrays. Preflight reports file/package availability and
 CUDA status; it cannot prove that upstream environments are compatible.
 
+Legacy SMPL pickles may contain Chumpy objects. To use them without Chumpy
+at runtime, first arrange `SMPL_FEMALE.pkl`, `SMPL_MALE.pkl`, and
+`SMPL_NEUTRAL.pkl` in a staging directory, then run the converter in a Python
+environment containing NumPy, SciPy, and Chumpy 0.70:
+
+```bash
+python scripts/convert_smpl_models.py /path/to/staged-models /path/to/new-converted-models
+```
+
+Alternatively, pass `--chumpy-source /path/to/extracted/chumpy-0.70` to use an
+extracted Chumpy source distribution. Copy the converted models into
+`Human_SMPL_Estimation/weights/smpl_data/smpl`. Conversion preserves the
+source files and checks the converted Chumpy array values. Only use trusted
+model pickles obtained from the model providers.
+
 ## Run human decoupling
 
 ```bash
@@ -102,6 +117,10 @@ Optional arguments:
 - `--smpl-models /path/to/smpl_data`: directory containing `smpl/`.
 - `--sam-config configs/sam2.1/sam2.1_hiera_l.yaml`: matching SAM configuration.
 - `--translation-steps 100 --pose-shape-steps 300`: optimization iterations.
+- `--render-max-edge 1024`: cap the differentiable rasterization resolution
+  to limit GPU memory use. Intrinsics are scaled for rasterization and soft
+  masks are bilinearly restored to original resolution. This approximates
+  fine silhouette detail; `0` uses native resolution and requires more memory.
 
 The output directory must be new. Each `person_000/`, `person_001/`, etc.
 contains:

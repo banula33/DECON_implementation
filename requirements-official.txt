@@ -3,6 +3,7 @@
 numpy
 Pillow
 smplx
+scipy
 PyYAML
 
 # Install SAT-HMR, SAM 2, PyTorch3D, and PowerPaint from their official

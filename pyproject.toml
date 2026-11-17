@@ -10,7 +10,7 @@ dependencies = ["torch>=2.2", "numpy", "Pillow"]
 
 [project.optional-dependencies]
 test = ["pytest"]
-official = ["smplx", "PyYAML"]
+official = ["smplx", "scipy", "PyYAML"]
 
 [project.scripts]
 decon-decouple = "decon.cli:main"

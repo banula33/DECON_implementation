@@ -1,5 +1,7 @@
 .venv/
 .venv-gpu/
+SMPL_python_v.1.1.0/
+mpips_smplify_public_v2/
 __pycache__/
 .pytest_cache/
 *.egg-info/

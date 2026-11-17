@@ -44,3 +44,28 @@ def test_real_renderer_translation_fit_improves_alignment():
     result = optimize_geometry(vertices, target, render,
                                config=GGDOConfig(translation_steps=25, pose_shape_steps=0, translation_lr=.01))
     assert ((result.geometry_mask - target) ** 2).mean() < result.losses[0] * .5
+
+
+def test_bounded_render_preserves_projection_resolution_and_gradients():
+    camera, vertices, reference = scene()
+    renderer = PyTorch3DSilhouetteRenderer(
+        torch.tensor([[0, 1, 2], [0, 2, 3]]), camera.image_size,
+        device='cpu', max_render_size=24,
+    )
+    translation = torch.tensor([.025, .01, .02], requires_grad=True)
+    mask = renderer.render_mask(vertices + translation, camera)
+    assert renderer.raster_size == (16, 24)
+    assert mask.shape == camera.image_size
+    expected = reference.render_mask(vertices + translation.detach(), camera).detach()
+    foreground = mask > .5
+    target = expected > .5
+    assert (foreground & target).sum() / (foreground | target).sum() > .8
+    ((mask - expected) ** 2).mean().backward()
+    assert torch.isfinite(translation.grad).all() and translation.grad.norm() > 0
+
+
+def test_bounded_render_rejects_camera_size_mismatch():
+    camera, vertices, renderer = scene()
+    wrong_camera = PinholeCamera(camera.intrinsics, (64, 96))
+    with pytest.raises(ValueError, match='image sizes differ'):
+        renderer.render_mask(vertices, wrong_camera)
