@@ -71,14 +71,56 @@ class OfficialSAM2Segmenter:
                 self._predictor = SAM2ImagePredictor.from_pretrained(self.model_id, device=self.device)
         return self._predictor
 
-    def segment(self, image: Any, bounding_box: Tensor) -> Tensor:
-        predictor = self._load()
+    def segment(self, image: Any, bounding_box: Tensor, *, points=None, labels=None, regions=None) -> Tensor:
         rgb = np.array(load_rgb(image), copy=True)
         box = bounding_box.detach().cpu().numpy().astype(np.float32)
+        if box.shape != (4,) or not np.isfinite(box).all() or (box[2:] <= box[:2]).any():
+            raise ValueError("Bounding box must be finite [left, top, right, bottom]")
+        prompts = {}
+        if labels is not None and points is None:
+            raise ValueError("Labels require points")
+        if points is not None:
+            points = np.asarray(points, dtype=np.float32)
+            labels = np.asarray(labels)
+            if points.ndim != 2 or points.shape[1] != 2 or labels.shape != (len(points),):
+                raise ValueError("Points must be Nx2 with one label per point")
+            if not np.isfinite(points).all() or not np.isin(labels, [0, 1]).all():
+                raise ValueError("Points must be finite and labels must be 0 or 1")
+            if (points < 0).any() or (points[:, 0] >= rgb.shape[1]).any() or (points[:, 1] >= rgb.shape[0]).any():
+                raise ValueError("Points must lie inside the input image")
+            prompts = dict(point_coords=points, point_labels=labels.astype(np.int32))
+        predictor = self._load()
         with torch.inference_mode():
             predictor.set_image(rgb)
-            masks, _, _ = predictor.predict(box=box, multimask_output=False)
-        return torch.from_numpy(np.asarray(masks[0], dtype=np.bool_))
+            masks, _, _ = predictor.predict(box=box, multimask_output=False, **prompts)
+        result = np.array(masks[0], dtype=np.bool_, copy=True)
+        # A small hand can disappear when the entire high-resolution image is
+        # encoded at SAM's fixed resolution. Re-encode explicitly selected local
+        # regions, then add their visible foreground to the whole-person mask.
+        for region in regions or []:
+            crop_box = np.asarray(region['box'])
+            if crop_box.shape != (4,) or not np.isfinite(crop_box).all():
+                raise ValueError("Region box must contain four finite coordinates")
+            x0, y0, x1, y1 = crop_box.astype(int)
+            if not (0 <= x0 < x1 <= rgb.shape[1] and 0 <= y0 < y1 <= rgb.shape[0]):
+                raise ValueError("Region box must lie inside the image")
+            region_points = np.asarray(region['points'], dtype=np.float32) - [x0, y0]
+            local_box = torch.as_tensor(region.get('prompt_box', [x0, y0, x1-1, y1-1]), dtype=torch.float32)
+            if local_box.shape != (4,) or not torch.isfinite(local_box).all():
+                raise ValueError("Region prompt_box must contain four finite coordinates")
+            local_box -= torch.tensor([x0, y0, x0, y0])
+            local = self.segment(rgb[y0:y1, x0:x1], local_box,
+                                 points=region_points, labels=region['labels'])
+            result[y0:y1, x0:x1] |= local.numpy()
+        return torch.from_numpy(result)
+
+    def release(self) -> None:
+        """Release model and cached image embeddings before completion."""
+        self._predictor = None
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 class OfficialPowerPaintInpainter:
@@ -97,11 +139,17 @@ class OfficialPowerPaintInpainter:
         seed: int = 42,
         version: str = "ppt-v2",
         local_files_only: bool = True,
+        crop_to_person: bool = True,
+        mask_dilation: int = 12,
     ) -> None:
         self.root = _require_path(Path(inpainting_root).resolve(), "PowerPaint checkout")
         self.checkpoint_dir = _require_path(Path(checkpoint_dir).resolve(), "PowerPaint checkpoint")
         self.settings = (prompt, negative_prompt, fitting_degree, ddim_steps, scale, seed, version, local_files_only)
         self._controller: Any = None
+        if mask_dilation < 0:
+            raise ValueError("mask_dilation must be nonnegative")
+        self.crop_to_person = crop_to_person
+        self.mask_dilation = mask_dilation
 
     def _load(self) -> Any:
         if self._controller is None:
@@ -126,9 +174,15 @@ class OfficialPowerPaintInpainter:
                 ) from exc
             *_, version, _ = self.settings
             dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-            self._controller = PowerPaintController(
-                dtype, str(self.checkpoint_dir), self.settings[-1], version
-            )
+            if version == "ppt-v2":
+                from .powerpaint_loader import build_v2_controller
+                self._controller = build_v2_controller(
+                    module, self.checkpoint_dir, dtype, self.settings[-1],
+                )
+            else:
+                self._controller = PowerPaintController(
+                    dtype, str(self.checkpoint_dir), self.settings[-1], version
+                )
         return self._controller
 
     def inpaint(self, image: Any, human_mask: Tensor, completion_mask: Tensor) -> Image.Image:
@@ -145,10 +199,20 @@ class OfficialPowerPaintInpainter:
         prompt, negative, fitting, steps, scale, seed, _, _ = self.settings
         # PowerPaint v2 multiplies a HxWx3 image by its mask; it needs RGB.
         input_image = {"image": isolated, "mask": mask_image(completion_mask).convert("RGB")}
+        box = None
+        if self.crop_to_person:
+            from .completion import prepare_completion
+            crop, generation_mask, box = prepare_completion(
+                isolated, human_mask, completion_mask, dilation=self.mask_dilation,
+            )
+            input_image = {"image": crop, "mask": generation_mask}
         outputs, _ = controller.predict(
             input_image, prompt, fitting, steps, scale, seed, negative,
             "text-guided", None, None,
         )
+        if box is not None:
+            from .completion import restore_completion
+            return restore_completion(outputs[0].convert("RGB"), isolated, completion_mask, box)
         generated = outputs[0].convert("RGB").resize(pil_image.size, Image.Resampling.LANCZOS)
         # Preserve visible pixels exactly and keep all other subjects/background out.
         return Image.composite(generated, isolated, mask_image(completion_mask))

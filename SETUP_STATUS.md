@@ -1,92 +1,132 @@
-# Real-image setup status — 17 November 2026
+# Real-image setup status — 19 November 2026
 
-The licensed body-model blocker is resolved. Full real-image reconstruction
-has not yet been validated.
+The real-image pipeline has completed SAT-HMR, geometry-prompted SAM 2, and
+both GGDO optimization stages for the three foreground players in the supplied
+football photo. PowerPaint has generated all three completed images, with exact
+visible-mask pixel preservation and original resolution. Visual acceptance failed
+on the central players because of hand and edge artifacts.
 
-## Models installed and checked
+## Installed and verified
 
-Runtime models are in:
+- Licensed female/male SMPL 1.1.0 models and SMPLify's neutral 1.0.0 model,
+  converted from Chumpy to NumPy without changing the array values.
+- The three public SAT-HMR support arrays.
+- Original licensed source folders are preserved. Both have ignore entries,
+  but the SMPLify folder was already tracked; ignore rules do not remove history.
+- `.venv` remains the CPU environment. `.venv-gpu` uses PyTorch 2.8.0+cu128,
+  torchvision 0.23.0+cu128, NumPy 1.26.4, and xFormers 0.0.32.post2.
+- PyTorch3D 0.7.8, commit `75ebeeaea0908c5527e7b1e305fbc7681382db47`,
+  was compiled for CUDA 12.8 and RTX 5050 (`sm_120`). GPU rasterization and
+  gradients work. The 30-test suite passes in the GPU environment; the CPU environment passes
+  28 tests with one optional test module skipped.
+- SAT-HMR and SAM 2 dependencies are installed. PowerPaint dependencies are
+  installed, and its controller imports successfully.
+- Transformers 4.37.2 supplies Python 3.12-compatible tokenizers;
+  huggingface-hub 0.25.2 retains APIs needed by Diffusers 0.27.0.
+  Exact runtime constraints are in `outputs/setup/gpu-constraints.txt`.
+- SAT-HMR checkpoint SHA-256 and xFormers wheel SHA-256 were checked against
+  their upstream digests.
 
-`vendor/DECON/Multi-View_Synthesis/Geo_Gui_Hm_Decou/Human_SMPL_Estimation/weights/smpl_data/smpl/`
+CUDA access requires execution outside the Codex sandbox on this machine.
+Inside-sandbox CUDA failures do not imply a broken driver.
 
-- `SMPL_FEMALE.pkl`: supplied SMPL 1.1.0 female model.
-- `SMPL_MALE.pkl`: supplied SMPL 1.1.0 male model.
-- `SMPL_NEUTRAL.pkl`: supplied SMPLify 1.0.0 neutral model, as specified by
-  the upstream setup instructions.
-- Public support files: `body_verts_smpl.npy`,
-  `J_regressor_h36m_correct.npy`, and `smpl_mean_params.npz`.
+## Real photo results
 
-The licensed source folders `SMPL_python_v.1.1.0/` and
-`mpips_smplify_public_v2/` are preserved and have Git ignore entries.
-The SMPLify folder was already tracked when this work started; ignore entries
-do not untrack those files or remove them from existing history.
-Runtime copies were converted from legacy Chumpy objects to NumPy arrays
-using `scripts/convert_smpl_models.py`. Converted Chumpy array values were
-checked against the originals. All three models load without Chumpy and
-produce finite `(1, 6890, 3)` meshes. The neutral model passed CPU and CUDA
-pose, shape, and translation gradient checks. The existing suite now passes 25 tests, including bounded-rendering checks.
+Input: `/home/kavin/Downloads/pexels-franco-monsalvo-252430633-32179295.jpg`
+(6000 × 3376). The original image is unchanged.
 
-The conversion used verified Chumpy 0.70 sources extracted under
-`/tmp/decon-chumpy/chumpy-0.70`, with system Python's NumPy/SciPy.
-Converted copies are also retained in `outputs/setup/converted-smpl/`.
-The converter requires a new destination and does not overwrite source files.
-SciPy is now included in the project's official dependency list because
-SMPL model pickles contain sparse matrices.
+SAT-HMR detected four people. The geometry pass selected the three largest
+projected boxes to focus on the foreground players. Results:
 
-## GPU and Python environments
+| Player | Geometry folder | Initial silhouette MSE | Fitted silhouette MSE |
+| --- | --- | ---: | ---: |
+| Central blue | `outputs/football/geometry/person_000` | 0.017611 | 0.014439 |
+| Central white | `outputs/football/geometry/person_001` | 0.014382 | 0.006033 |
+| Right blue, refined | `outputs/football/right_refined/person_000` | 0.018011 | 0.005886 |
 
-- NVIDIA GeForce RTX 5050 Laptop GPU, 8 GB VRAM, driver 580.178.04.
-- `.venv` remains the working CPU test environment.
-- `.venv-gpu` now has PyTorch 2.8.0+cu128 and torchvision 0.23.0+cu128.
-  A CUDA tensor operation passed on the actual GPU.
-- `nvidia-smi` and CUDA require execution outside the Codex sandbox here.
-  Failure inside the sandbox does not imply a driver problem.
-- NumPy 1.26.4, SciPy, smplx, Hydra, iopath, and supporting build packages
-  are installed in `.venv-gpu`. SAT-HMR dependencies and xFormers are now
-  downloading; the pinned PyTorch3D source has been fetched and its GPU wheel is building.
-- The body-model CPU smoke check used `.venv` with
-  `PYTHONPATH=/usr/lib/python3/dist-packages` to access the already installed
-  system NumPy/SciPy while dedicated dependencies downloaded.
-- The CUDA body-model smoke check used `.venv-gpu` with that same system
-  dependency path, plus `.venv`'s installed smplx package. It verified actual
-  GPU execution, but does not establish a self-contained GPU environment.
-- PyTorch3D 0.7.8 was compiled for CUDA 12.8 and the RTX 5050 (`sm_120`).
-  CUDA rasterization and translation gradients passed. A synthetic SMPL
-  forward/backward check at the photo's 6000 × 3376 output dimensions used
-  about 1.14 GiB peak allocated GPU memory with a 1024-pixel raster edge.
-  All 25 tests pass in both CPU and GPU environments.
-- SAT-HMR inference and PowerPaint loading/inference remain unvalidated.
-  The separate GPU environment is not yet ready for the full pipeline.
+Each folder includes a mesh, parameters, masks, and before/after overlays.
+The original right-player result is preserved as `geometry/person_002`.
+Its tight box missed lower-leg pixels; a visually reviewed 20% projected-box
+margin recovered the legs and feet, so the right player was refitted.
+The other two players retain the default 2.5% margin. This is per-image
+prompt tuning, not an automatically validated general box-selection rule.
 
-## Checkpoints
+The geometry pass uses 100 translation steps and 300 pose/shape steps.
+Rasterization is capped at 1024 pixels on the longest edge, with scaled camera
+intrinsics and differentiable restoration to full-resolution masks. A synthetic
+SMPL forward/backward memory check at the photo's output size used about
+1.14 GiB of allocated GPU memory. Fine silhouette boundaries are approximate.
 
-- SAT-HMR `sat_644.pth` downloaded, revision
-  `6b40d93a8ffec552a2098b15996e116d9e32efe5`.
-- SAM 2.1 Hiera large has finished downloading and passed GPU inference on
-  the supplied photo. PowerPaint v2 downloads remain incomplete and resumed
-  from partial files after connection resets/timeouts.
-- PowerPaint revision: `49ce8271db56ea91e7e9412789ba7faa2e7c83f1`.
-- Download progress/errors: `outputs/setup/checkpoint-downloads.log`.
-- Resume script: `outputs/setup/download_public_checkpoints.py`.
-  Do not launch a second copy while a download is still running.
-- Files ending in `.partial` must not be used for inference.
+The SAT-HMR bridge now moves target metadata to the GPU alongside the image;
+without this, the real run failed during camera-intrinsics calculation.
 
-The published PowerPaint U-Net file is named
-`diffusion_pytorch_model-002.safetensors`. After download, create a
-`diffusion_pytorch_model.safetensors` symlink in the same directory for the
-loader. PowerPaint's additional `runwayml/stable-diffusion-v1-5` base-model
-cache has not been prepared. Loading and memory use on this 8 GB GPU remain
-untested.
+Lower silhouette loss does not establish anatomical correctness. The central
+blue player remains substantially occluded, and SAM omits some disconnected
+visible arm regions. The completed central blue player has detached hand shapes and dark contours;
+the white player has dark edge artifacts. The right player is cleaner. These
+outputs are not yet accepted for multi-view reconstruction.
 
-## Remaining acceptance work
+## Completion results and memory fix
 
-The supplied football photo is staged under `outputs/football/input/`.
-SAM-only diagnostic previews are available under `outputs/football/sam_preview/`;
-see `outputs/football/STATUS.md` for their limitations.
-After dependencies and checkpoints are ready, run the CLI from README.md.
-Inspect separate person masks, camera projections, optimized silhouettes,
-completion quality, resolution, and preservation of visible pixels.
-No full reconstruction or quality claim has been made.
+All three completed images are available in `outputs/football/completion/`:
+`person_000_completed.png`, `person_001_completed.png`, and
+`person_002_completed.png`. Each is 6000 × 3376. `review.jpg` shows cropped
+previews together. `quality_review.json` records the failed visual acceptance.
 
-Multi-view synthesis, NeuS, and PAPO remain downstream work after decoupling
-is validated on real images.
+The kernel journal confirms that the original worker (PID 142574) was killed by
+the system OOM killer on 17 November at 17:58:32 +05:30, during model loading.
+It was not merely waiting for more files. All checkpoints and base components
+have now downloaded, and the controller imports and performs inference.
+
+`decon/powerpaint_loader.py` avoids redundant initialized UNet copies and loads
+complete BrushNet weights into an empty model after checking keys and shapes.
+Components materialize on the GPU before CPU offloading is enabled. The official
+controller prediction method and trained weights are retained. The new loader
+also avoids the upstream move back to CUDA immediately after enabling offloading.
+
+Measured comparison:
+
+- Reference run, original loader, three players: peak RSS 10.45 GiB.
+- Revised loader, first player regenerated with seed 42: peak RSS 7.53 GiB.
+- The regenerated image is pixel-for-pixel identical to the reference first player.
+- The two runs have different image counts; this is a recorded run comparison,
+  not a general memory guarantee for all workloads or machine states.
+
+Evidence: `outputs/football/completion_memory_v2/comparison.json`,
+`outputs/football/logs/completion_retry.log`, and
+`outputs/football/logs/completion_memory_v2.log`.
+
+PowerPaint weights use revision `49ce8271db56ea91e7e9412789ba7faa2e7c83f1`.
+The canonical U-Net symlink exists. For local cached base models, use
+`HF_HOME=/home/kavin/DECON_implementation/checkpoints/huggingface`.
+No downloads or completion jobs need to remain running for these saved results.
+Historical PID files may refer to exited workers; the current result status is
+`outputs/football/completion/status.json`.
+
+## Remaining validation
+
+The official repository was fetched and checked against upstream on 19 November;
+the local checkout already matches commit `992364634b73bba05d68d5930ff20627e0487b4b`.
+All downstream source directories are present, but the trained multi-view stage
+checkpoints are missing and no download link is provided in the checked source.
+See [OFFICIAL_ASSETS.md](OFFICIAL_ASSETS.md) for the inventory and exact filenames.
+
+Two additional AI-generated photos (walking and overlapping dancers) have now
+completed the full CLI with two people each. All four outputs preserve visible
+pixels exactly and retain 1536 × 1024 resolution; silhouette MSE decreases by
+27.1%, 28.0%, 6.3%, and 51.5%. Both cases fail visual acceptance: completion adds
+dark fragments/strips, and the rear dancer's reconstructed foot is misaligned.
+Review sheets, exact generation prompts, measurements and findings are saved in
+`outputs/synthetic_validation/REPORT.md`. These synthetic images have no
+ground-truth meshes and do not replace real-photo accuracy validation.
+
+The initial integrated runs exposed CUDA OOM during PowerPaint loading while SAM
+was resident. The pipeline now fits all people, releases SAM and its cached image
+embeddings, then performs completion. Both full reruns succeeded; the GPU suite
+still passes all 30 tests, including the segmentation/release/completion order.
+
+Improve disconnected-arm segmentation and completion-mask geometry, and evaluate
+person-centered inpainting crops separately. Additional images with different
+poses/occlusion are still needed for broader real-photo validation; the football
+photo remains the only real-photo case processed. Multi-view synthesis, NeuS, and PAPO remain downstream work
+until visual acceptance improves.

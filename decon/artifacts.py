@@ -50,6 +50,8 @@ def save_results(image, people: list[DecoupledPerson], output_dir: str | Path, f
             'initial_poses': values(person.estimate.pose), 'initial_betas': values(person.estimate.shape),
             'initial_transl': values(person.estimate.translation),
             'bounding_box': values(person.bounding_box), 'losses': person.losses,
+            'completion_policy': person.completion_policy,
+            'segmentation_prompt': person.segmentation_prompt,
             'initial_mse': float(((person.initial_geometry_mask - person.estimate.mask.float()) ** 2).mean()),
             'final_mse': float(((person.geometry_mask - person.estimate.mask.float()) ** 2).mean()),
         }

@@ -9,6 +9,18 @@ from pathlib import Path
 import sys
 
 
+def move_target_tensors(value, device):
+    """Move nested target tensors while preserving filenames and other metadata."""
+    import torch
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, dict):
+        return {key: move_target_tensors(item, device) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(move_target_tensors(item, device) for item in value)
+    return value
+
+
 def export_predictions(outputs, targets, destination, threshold):
     import numpy as np
     import torch
@@ -56,6 +68,7 @@ def main():
     device = next(model.parameters()).device
     # The adapter provides exactly one input image in a private directory.
     for samples, targets in engine.infer_dataloader:
+        targets = move_target_tensors(targets, device)
         with torch.inference_mode():
             outputs = model([sample.to(device) for sample in samples], targets)
         export_predictions(outputs, targets, options.output_dir, options.threshold)

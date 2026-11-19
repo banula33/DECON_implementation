@@ -43,3 +43,5 @@ class DecoupledPerson:
     optimized_pose: Optional[Tensor] = None
     optimized_shape: Optional[Tensor] = None
     optimized_translation: Optional[Tensor] = None
+    completion_policy: str = 'silhouette'
+    segmentation_prompt: Optional[dict[str, Any]] = None

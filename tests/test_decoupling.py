@@ -9,7 +9,19 @@ from PIL import Image
 from decon import GGDOConfig, HumanDecouplingPipeline, HumanEstimate, PinholeCamera
 from decon.artifacts import save_results
 from decon.official_adapters import OfficialPowerPaintInpainter, OfficialSATHMRGeometryEstimator
-from decon.sat_hmr_runner import export_predictions
+from decon.sat_hmr_runner import export_predictions, move_target_tensors
+
+
+def test_target_device_transfer_preserves_non_tensor_metadata():
+    targets = [{'img_size': torch.tensor([40, 60]), 'img_path': 'photo.jpg',
+                'nested': (torch.ones(2), {'scale': torch.tensor(2.)}), 'flag': True}]
+    moved = move_target_tensors(targets, 'meta')
+    assert moved[0]['img_size'].device.type == 'meta'
+    assert moved[0]['nested'][0].device.type == 'meta'
+    assert moved[0]['nested'][1]['scale'].device.type == 'meta'
+    assert isinstance(moved[0]['nested'], tuple)
+    assert moved[0]['img_path'] == 'photo.jpg' and moved[0]['flag'] is True
+    assert targets[0]['img_size'].device.type == 'cpu'
 
 
 def test_camera_projection_and_resize():
@@ -85,7 +97,8 @@ def test_no_completion_skips_model_loading(tmp_path, monkeypatch):
     assert result.size == (8, 6)
 
 
-def test_two_person_pipeline_and_artifacts(tmp_path):
+@pytest.mark.parametrize('completion_policy', ['occlusion', 'silhouette'])
+def test_two_person_pipeline_and_artifacts(tmp_path, completion_policy):
     camera = PinholeCamera(torch.tensor([[20., 0, 16.], [0, 20., 16.], [0, 0, 1.]]), (32, 32))
     vertices = torch.tensor([[-0.4, -0.5, 2.], [0.4, 0.5, 2.]])
     estimates = [HumanEstimate(vertices + torch.tensor([dx, 0., 0.]), torch.zeros(32, 32), camera) for dx in (-0.7, 0.7)]
@@ -100,7 +113,9 @@ def test_two_person_pipeline_and_artifacts(tmp_path):
     image_path = tmp_path / 'input.png'
     Image.fromarray(pixels).save(image_path)
     index = iter(range(2))
+    events = []
     def segment(image, box):
+        events.append('segment')
         assert isinstance(image, Image.Image)
         assert (box >= 0).all() and (box <= 31).all()
         return masks[next(index)]
@@ -109,23 +124,33 @@ def test_two_person_pipeline_and_artifacts(tmp_path):
         y, x = torch.meshgrid(torch.arange(32), torch.arange(32), indexing='ij')
         return torch.exp(-((x-center[0])**2 + (y-center[1])**2) / 30)
     def inpaint(image, mask, completion):
+        assert events[:3] == ['segment', 'segment', 'release']
+        events.append('inpaint')
         assert (np.asarray(image)[~mask] == 255).all()
         return image
     pipeline = HumanDecouplingPipeline(
-        SimpleNamespace(estimate=lambda image: estimates), SimpleNamespace(segment=segment),
+        SimpleNamespace(estimate=lambda image: estimates),
+        SimpleNamespace(segment=segment, release=lambda: events.append('release')),
         SimpleNamespace(render_mask=render), SimpleNamespace(inpaint=inpaint),
-        ggdo_config=GGDOConfig(translation_steps=10, pose_shape_steps=0))
+        ggdo_config=GGDOConfig(translation_steps=10, pose_shape_steps=0),
+        completion_policy=completion_policy)
     people = pipeline.run(image_path)
+    assert events == ['segment', 'segment', 'release', 'inpaint', 'inpaint']
     assert len(people) == 2
     for person, mask in zip(people, masks):
         assert torch.equal(person.estimate.mask, mask)
         assert not (person.completion_mask & mask).any()
         assert person.image.size == (32, 32)
+        expected = (person.geometry_mask > 0.5) & ~mask
+        if completion_policy == 'occlusion':
+            expected &= masks[0] | masks[1]
+        assert torch.equal(person.completion_mask, expected)
     output = save_results(image_path, people, tmp_path / 'out', torch.tensor([[0, 1, 0]]))
     assert json.loads((output / 'manifest.json').read_text())['people'] == 2
     assert (output / 'person_000/completed.png').is_file()
     data = json.loads((output / 'person_001/parameters.json').read_text())
     assert data['final_mse'] <= data['initial_mse']
+    assert data['completion_policy'] == completion_policy
     with pytest.raises(FileExistsError):
         save_results(image_path, people, output, torch.tensor([[0, 1, 0]]))
 
@@ -151,6 +176,46 @@ def test_sam_receives_rgb_and_pixel_box(tmp_path):
     mask = adapter.segment(Image.new('RGB', (10, 12)), torch.tensor([1, 2, 8, 9]))
     assert calls == [(12, 10, 3)]
     assert mask.dtype == torch.bool and mask.shape == (12, 10)
+
+
+def test_sam_positive_negative_points(tmp_path):
+    from decon.official_adapters import OfficialSAM2Segmenter
+    adapter = OfficialSAM2Segmenter(tmp_path, device='cpu')
+    def predict(**kwargs):
+        assert kwargs['point_coords'].tolist() == [[2., 3.], [8., 9.]]
+        assert kwargs['point_labels'].tolist() == [1, 0]
+        return np.ones((1, 12, 10)), None, None
+    adapter._predictor = SimpleNamespace(set_image=lambda _: None, predict=predict)
+    image = Image.new('RGB', (10, 12))
+    box = torch.tensor([1, 2, 8, 9])
+    adapter.segment(image, box, points=[[2, 3], [8, 9]], labels=[1, 0])
+    with pytest.raises(ValueError, match='inside'):
+        adapter.segment(image, box, points=[[10, 3]], labels=[1])
+    with pytest.raises(ValueError, match='one label'):
+        adapter.segment(image, box, points=[[2, 3]], labels=[])
+
+
+def test_sam_region_recovers_disconnected_piece_in_original_coordinates(tmp_path):
+    from decon.official_adapters import OfficialSAM2Segmenter
+    adapter = OfficialSAM2Segmenter(tmp_path, device='cpu')
+    state = {}
+    def set_image(rgb):
+        state['shape'] = rgb.shape[:2]
+    def predict(**kwargs):
+        h, w = state['shape']
+        result = np.zeros((1, h, w), bool)
+        if (h, w) == (12, 10):
+            result[0, 1:4, 1:4] = True
+        else:
+            assert (h, w) == (4, 4)
+            assert kwargs['point_coords'].tolist() == [[1., 1.]]
+            result[0, 1:3, 1:3] = True
+        return result, None, None
+    adapter._predictor = SimpleNamespace(set_image=set_image, predict=predict)
+    result = adapter.segment(Image.new('RGB', (10, 12)), torch.tensor([0, 0, 9, 11]),
+                             regions=[{'box': [6, 7, 10, 11], 'points': [[7, 8]], 'labels': [1]}])
+    assert result[1:4, 1:4].all() and result[8:10, 7:9].all()
+    assert int(result.sum()) == 13
 
 
 def test_smpl_wrapper_preserves_translation_and_parameter_gradients(tmp_path, monkeypatch):
@@ -240,7 +305,8 @@ class Engine:
 
 
 @pytest.mark.parametrize('enabled', [True, False])
-def test_powerpaint_import_preserves_caller_gradient_mode(tmp_path, monkeypatch, enabled):
+@pytest.mark.parametrize('version', ['ppt-v1', 'ppt-v2'])
+def test_powerpaint_import_preserves_caller_gradient_mode(tmp_path, monkeypatch, enabled, version):
     # The real upstream app has this process-wide side effect on import.
     (tmp_path / 'app.py').write_text(
         'import torch\n'
@@ -250,7 +316,8 @@ def test_powerpaint_import_preserves_caller_gradient_mode(tmp_path, monkeypatch,
     )
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
     monkeypatch.syspath_prepend(str(tmp_path))
-    adapter = OfficialPowerPaintInpainter(tmp_path, tmp_path)
+    monkeypatch.setattr('decon.powerpaint_loader.build_v2_controller', lambda *args: object())
+    adapter = OfficialPowerPaintInpainter(tmp_path, tmp_path, version=version)
     with torch.set_grad_enabled(enabled):
         adapter._load()
         assert torch.is_grad_enabled() is enabled
