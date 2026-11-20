@@ -45,3 +45,6 @@ class DecoupledPerson:
     optimized_translation: Optional[Tensor] = None
     completion_policy: str = 'silhouette'
     segmentation_prompt: Optional[dict[str, Any]] = None
+
+    raw_mask: Optional[Tensor] = None
+    mask_refinement: Optional[dict[str, Any]] = None

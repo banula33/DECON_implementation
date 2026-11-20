@@ -21,10 +21,12 @@ def main(argv=None):
     parser.add_argument('--allow-model-downloads', action='store_true', help='Allow PowerPaint to download base models')
     parser.add_argument('--segmentation-prompts', type=Path,
                         help='JSON with people keyed by detection index: optional box, points and labels (1=include, 0=exclude), in original pixels')
+    parser.add_argument('--mask-smoothing', type=float, default=0.65, help='Boundary smoothing sigma in image pixels; 0 disables')
+    parser.add_argument('--mask-min-area', type=int, default=12, help='Remove islands/fill enclosed holes smaller than this many pixels; 0 disables')
     parser.add_argument('--legacy-inpainting', action='store_true', help='Use full-frame completion without crop or dilation for comparison')
-    parser.add_argument('--person-crop', action='store_true', help='Opt into the local person-crop/dilated-mask experiment')
-    parser.add_argument('--completion-policy', choices=['occlusion', 'silhouette'], default='silhouette',
-                        help='Geometry minus visible mask (default), or the experimental occlusion-only heuristic')
+    parser.add_argument('--person-crop', action=argparse.BooleanOptionalAction, default=True, help='Use a person-centered completion crop (default); --no-person-crop disables')
+    parser.add_argument('--completion-policy', choices=['occlusion', 'silhouette'], default='occlusion',
+                        help='Occlusion-only completion (default), or geometry minus visible mask')
     parser.add_argument('--ggdo-profile', choices=['paper', 'released-code'], default='released-code',
                         help='Released optimizer settings, or MSE objective described in the paper; neither restores missing upstream renderer code')
     parser.add_argument('--inpainting-task', choices=['text-guided','shape-guided'], default='text-guided')
@@ -34,6 +36,9 @@ def main(argv=None):
     parser.add_argument('--render-max-edge', type=int, default=512,
                         help='Maximum rasterization edge; masks retain input resolution (0 uses native resolution)')
     args = parser.parse_args(argv)
+    import math
+    if not math.isfinite(args.mask_smoothing) or args.mask_smoothing < 0 or args.mask_min_area < 0:
+        parser.error('Mask smoothing and minimum area must be finite and nonnegative')
     if args.render_max_edge < 0:
         parser.error('--render-max-edge must be nonnegative')
 
@@ -73,6 +78,7 @@ def main(argv=None):
         body_model=body,
         segmentation_prompts=prompts,
         completion_policy=args.completion_policy,
+        mask_smoothing=args.mask_smoothing, mask_min_area=args.mask_min_area,
         ggdo_config=ggdo,
     )
     people = pipeline.run(rgb)
@@ -84,6 +90,7 @@ def main(argv=None):
         'inpainting_task':args.inpainting_task,'inpainting_prompt':args.inpainting_prompt,
         'person_crop':args.person_crop and not args.legacy_inpainting,
         'segmentation_prompts':prompts,
+        'mask_smoothing':args.mask_smoothing,'mask_min_area':args.mask_min_area,
         'exact_upstream_reproduction':False,
     },indent=2)+'\n')
     print(f'Saved {len(people)} decoupled people to {args.output}')

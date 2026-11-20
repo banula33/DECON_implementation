@@ -32,24 +32,30 @@ def build_v2_controller(module, checkpoint_dir, dtype, local_files_only=True):
             if tuple(weights.get_slice(key).get_shape()) != tuple(value.shape):
                 raise ValueError(f"BrushNet checkpoint shape mismatch: {key}")
     del expected
-    # Materialize components on the GPU as they load, rather than retaining
-    # multiple full models in host RAM during construction. CPU offloading is
-    # installed only after all temporary checkpoint state has been released.
+    # Materialize one component on the GPU at a time, then move it to CPU.
+    # This avoids concurrent component residency during fp32-to-fp16 loading
+    # on 6 GB GPUs. Install inference offloading after construction.
     device_index = torch.cuda.current_device()
     device = f"cuda:{device_index}"
     load_checkpoint_in_model(brushnet, str(checkpoint), device_map={"": device}, dtype=dtype)
     if any(value.is_meta for value in brushnet.parameters()):
         raise ValueError("BrushNet checkpoint left uninitialized parameters")
+    brushnet.to("cpu")
+    torch.cuda.empty_cache()
 
     unet = module.UNet2DConditionModel.from_pretrained(
         str(base), subfolder="unet", torch_dtype=dtype,
         low_cpu_mem_usage=True, local_files_only=local_files_only, device_map={"": device},
     )
+    unet.to("cpu")
+    torch.cuda.empty_cache()
     encoder = module.CLIPTextModel.from_pretrained(
         "runwayml/stable-diffusion-v1-5", subfolder="text_encoder",
         torch_dtype=dtype, low_cpu_mem_usage=True, local_files_only=local_files_only,
         device_map={"": device},
     )
+    encoder.to("cpu")
+    torch.cuda.empty_cache()
     pipe = module.StableDiffusionPowerPaintBrushNetPipeline.from_pretrained(
         str(base), unet=unet, brushnet=brushnet, text_encoder_brushnet=encoder,
         torch_dtype=dtype, low_cpu_mem_usage=True, safety_checker=None,

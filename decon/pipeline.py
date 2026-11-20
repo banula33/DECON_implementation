@@ -20,6 +20,8 @@ class HumanDecouplingPipeline:
         ggdo_config: GGDOConfig | None = None,
         segmentation_prompts: dict | None = None,
         completion_policy: str = 'silhouette',
+        mask_smoothing: float = 0,
+        mask_min_area: int = 0,
     ) -> None:
         self.geometry_estimator = geometry_estimator
         self.segmenter = segmenter
@@ -33,6 +35,8 @@ class HumanDecouplingPipeline:
         if completion_policy not in ('occlusion', 'silhouette'):
             raise ValueError("completion_policy must be occlusion or silhouette")
         self.completion_policy = completion_policy
+        self.mask_smoothing = mask_smoothing
+        self.mask_min_area = mask_min_area
 
     def run(self, image: Any) -> list[DecoupledPerson]:
         rgb = load_rgb(image)
@@ -52,6 +56,16 @@ class HumanDecouplingPipeline:
                 raise ValueError("Segmentation must retain the original image resolution")
             if not mask.any():
                 raise ValueError("SAM returned an empty person mask")
+            raw_mask = mask.clone()
+            if self.mask_smoothing or self.mask_min_area:
+                from .segmentation import refine_mask
+                seed_points = list(correction.get('points', []))
+                seed_labels = list(correction.get('labels', []))
+                for region in correction.get('regions', []):
+                    seed_points.extend(region['points'])
+                    seed_labels.extend(region['labels'])
+                mask = refine_mask(mask, sigma=self.mask_smoothing, min_area=self.mask_min_area,
+                                   points=seed_points, labels=seed_labels)
             estimate.mask = mask
             render = lambda vertices: self.renderer.render_mask(vertices, estimate.camera)
             initial_mask = render(estimate.vertices).detach()
@@ -74,6 +88,7 @@ class HumanDecouplingPipeline:
             segmented_image = isolate(rgb, mask)
             results.append(DecoupledPerson(
                 estimate=estimate, optimized_vertices=ggdo.vertices,
+                raw_mask=raw_mask, mask_refinement=dict(sigma=self.mask_smoothing, min_area=self.mask_min_area),
                 geometry_mask=ggdo.geometry_mask, completion_mask=completion,
                 image=None, losses=ggdo.losses, segmented_image=segmented_image,
                 initial_geometry_mask=initial_mask, bounding_box=box,

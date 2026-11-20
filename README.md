@@ -127,14 +127,20 @@ Optional arguments:
 - `--sam-config configs/sam2.1/sam2.1_hiera_l.yaml`: matching SAM configuration.
 - `--segmentation-prompts prompts.json`: optional box corrections and positive/
   negative points for missed visible limbs. Coordinates use the original image.
-- `--completion-policy silhouette`: default geometry-minus-visible-mask support.
-  `occlusion` opts into the local conservative intersection experiment.
+- `--completion-policy occlusion`: default conservative completion, restricted to
+  geometry hidden by other segmented people. `silhouette` restores the broader
+  geometry-minus-visible-mask rule. This refinement does not handle object occlusion.
+- `--mask-smoothing 0.65 --mask-min-area 12`: gently smooth boundaries and remove
+  tiny islands/fill enclosed pinholes before GGDO and completion. Values use original
+  image pixels. Disconnected hands are retained; positive prompts protect small
+  components. Set both to `0` to disable cleanup. Raw masks are saved as
+  `segmentation_raw.png` alongside the cleaned `segmentation.png`.
 - `--ggdo-profile released-code`: default optimizer port with L1 mask loss, pose
   prior, fixed depth and stage-2 translation; `paper` selects the MSE formulation.
 - `--inpainting-task text-guided` or `shape-guided`, and `--inpainting-prompt`:
   explicit inference choices; the paper does not publish its exact settings.
-- `--person-crop`: opt into person-centered crops and mask dilation. By default
-  the CLI uses full-frame input. `--legacy-inpainting` also forces full-frame.
+- `--person-crop`: person-centered crops and generation-mask dilation are enabled
+  by default. `--no-person-crop` or `--legacy-inpainting` restores full-frame input.
 - `--translation-steps` and `--pose-shape-steps`: override profile iteration counts
   (released code: 100/100; paper-formulation profile: local defaults 100/300).
 - `--render-max-edge 512`: cap the differentiable rasterization resolution
@@ -177,12 +183,12 @@ are retained for subsequent reconstruction and scene positioning.
   people and background are replaced with white before PowerPaint. Generated
   pixels are composited only inside the completion mask; visible pixels are
   preserved exactly. PowerPaint's resized output is restored to input size.
-  The optional `occlusion` policy intersects this difference with other people's visible masks to
+  The CLI default `occlusion` policy intersects this difference with other people's visible masks to
   avoid generating anatomy from exposed silhouette errors. This is an engineering
   refinement, not the paper's original mask rule. It does not address occlusion by
   objects or out-of-frame anatomy, and depends on the quality of the other masks.
   An empty completion mask skips the diffusion model.
-  With `--person-crop`, PowerPaint receives a square crop with 12% context and a generation mask
+  With the default `--person-crop`, PowerPaint receives a square crop with 12% context and a generation mask
   dilated by 12 pixels at its 640-pixel working size. Only the original, undilated
   completion region is composited back; visible pixels remain exact.
 - PowerPaint v2 retains the official prediction code and weights, but constructs
