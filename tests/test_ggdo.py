@@ -71,3 +71,31 @@ def test_rejects_mismatched_coordinate_frames():
     with pytest.raises(ValueError, match='reproduce'):
         optimize_geometry(body(pose, shape, trans) + 1, torch.ones(24, 24), gaussian_renderer,
                           body_model=body, pose=pose, shape=shape, translation=trans)
+
+
+def test_released_profile_keeps_depth_and_stage_two_translation_fixed():
+    from dataclasses import replace
+    pose, shape, trans = torch.zeros(24, 3), torch.zeros(10), torch.tensor([10., 10., 2.])
+    vertices = body(pose, shape, trans)
+    def depth_renderer(v):
+        return gaussian_renderer(v + torch.stack([v[:, 2], v[:, 2], v[:, 2]], dim=1))
+    target = depth_renderer(vertices + torch.tensor([1., 1., 1.]))
+    first = optimize_geometry(vertices, target, depth_renderer, body_model=body,
+        pose=pose, shape=shape, translation=trans,
+        config=replace(GGDOConfig.released_code(),translation_steps=20,pose_shape_steps=0))
+    both = optimize_geometry(vertices, target, depth_renderer, body_model=body,
+        pose=pose, shape=shape, translation=trans,
+        config=replace(GGDOConfig.released_code(),translation_steps=20,pose_shape_steps=20))
+    assert first.translation[2] == trans[2]
+    assert not torch.equal(first.translation[:2],trans[:2])
+    assert torch.equal(first.translation,both.translation)
+    assert torch.allclose(both.vertices,body(both.pose,both.shape,both.translation))
+
+
+def test_released_objective_scale_matches_code():
+    from decon.ggdo import _mask_loss
+    pred=torch.tensor([[0.,0.5],[1.,1.]])
+    target=torch.tensor([[1.,0.],[1.,0.]])
+    config=GGDOConfig.released_code()
+    assert torch.allclose(config.mask_weight*_mask_loss(pred,target,config.mask_metric),
+                          torch.abs(pred*100-target*100).mean())

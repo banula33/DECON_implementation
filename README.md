@@ -4,7 +4,7 @@ Implementation of the human-decoupling stage in **DECON: Reconstruction of
 Clothed-Geometric Multiple Humans from a Single Image via Geometry-Guided
 Decoupling** (AAAI 2026, section 3.2).
 
-The code now connects SAT-HMR → camera-projected bounding boxes → SAM 2 →
+The code now connects SAT-HMR → learned detection boxes → SAM 2 →
 two-stage SMPL GGDO → isolated PowerPaint completion. Multi-view synthesis,
 NeuS reconstruction, and PAPO are not implemented here.
 
@@ -28,6 +28,10 @@ The supplied football photo has now passed through SAT-HMR, SAM 2, GGDO, and
 PowerPaint. Outputs preserve the visible-mask pixels and original resolution,
 but the central players have hand/edge artifacts, so visual acceptance has not
 passed. See [current run notes](SETUP_STATUS.md).
+
+The [paper/source audit](PAPER_REPRODUCTION_AUDIT.md) documents corrected
+deviations, differences between the paper and released optimizer, and missing
+upstream components. This is not a verified exact reproduction.
 
 ## Install
 
@@ -123,13 +127,17 @@ Optional arguments:
 - `--sam-config configs/sam2.1/sam2.1_hiera_l.yaml`: matching SAM configuration.
 - `--segmentation-prompts prompts.json`: optional box corrections and positive/
   negative points for missed visible limbs. Coordinates use the original image.
-- `--completion-policy occlusion`: conservative default, filling only predicted
-  body regions covered by another person's segmentation. `silhouette` restores
-  the paper-style geometry-minus-mask baseline, including exposed edge errors.
-- `--legacy-inpainting`: disable person-centered crop and generation-mask dilation
-  for comparison; combine with `--completion-policy silhouette` for the old path.
-- `--translation-steps 100 --pose-shape-steps 300`: optimization iterations.
-- `--render-max-edge 1024`: cap the differentiable rasterization resolution
+- `--completion-policy silhouette`: default geometry-minus-visible-mask support.
+  `occlusion` opts into the local conservative intersection experiment.
+- `--ggdo-profile released-code`: default optimizer port with L1 mask loss, pose
+  prior, fixed depth and stage-2 translation; `paper` selects the MSE formulation.
+- `--inpainting-task text-guided` or `shape-guided`, and `--inpainting-prompt`:
+  explicit inference choices; the paper does not publish its exact settings.
+- `--person-crop`: opt into person-centered crops and mask dilation. By default
+  the CLI uses full-frame input. `--legacy-inpainting` also forces full-frame.
+- `--translation-steps` and `--pose-shape-steps`: override profile iteration counts
+  (released code: 100/100; paper-formulation profile: local defaults 100/300).
+- `--render-max-edge 512`: cap the differentiable rasterization resolution
   to limit GPU memory use. Intrinsics are scaled for rasterization and soft
   masks are bilinearly restored to original resolution. This approximates
   fine silhouette detail; `0` uses native resolution and requires more memory.
@@ -152,27 +160,29 @@ are retained for subsequent reconstruction and scene positioning.
 
 - SAT-HMR runs in a subprocess with a private input/output directory. The bridge
   exports the model's actual intrinsics, camera-space vertices, pose, shape,
-  and translation. Intrinsics are rescaled to the original image resolution.
-- SAM 2 receives projected, padded, clipped pixel-space boxes. Empty detections
+  translation and detection boxes. Intrinsics and boxes are rescaled to the
+  original image resolution. Older cached exports without boxes fall back to
+  mesh bounds; rerun SAT-HMR for the corrected automatic segmentation path.
+- SAM 2 receives learned, padded, clipped pixel-space boxes. Empty detections
   and empty masks fail explicitly.
-- GGDO first optimizes translation, then pose, shape, and translation through a
-  differentiable SMPL model. The objective is silhouette MSE, following paper
-  equations 3–4; the best encountered fit is retained. This follows the paper's
-  formulation rather than copying all heuristics in the released GGDO script.
-  The iteration counts and learning rates are configurable engineering defaults,
-  not claimed paper hyperparameters. No unconstrained vertex deformation is used.
+- The CLI's released-code GGDO profile first optimizes XY translation at fixed
+  depth, then pose and shape with translation fixed. It uses 100-scaled L1 mask
+  error, a pose-preservation penalty of 50, AMSGrad and plateau LR scheduling.
+  A separate profile implements the paper's MSE objective. Both retain a coherent
+  best parameter state and use a differentiable SMPL model; neither reconstructs
+  the missing upstream renderer. See the audit for the remaining differences.
 - The SMPL forward result must reproduce SAT-HMR's vertices before fitting.
   This catches body-model or coordinate-system mismatches early.
 - Completion is the optimized silhouette minus the visible person mask. Other
   people and background are replaced with white before PowerPaint. Generated
   pixels are composited only inside the completion mask; visible pixels are
   preserved exactly. PowerPaint's resized output is restored to input size.
-  The default intersects this difference with other people's visible masks to
+  The optional `occlusion` policy intersects this difference with other people's visible masks to
   avoid generating anatomy from exposed silhouette errors. This is an engineering
   refinement, not the paper's original mask rule. It does not address occlusion by
   objects or out-of-frame anatomy, and depends on the quality of the other masks.
   An empty completion mask skips the diffusion model.
-  PowerPaint receives a square person crop with 12% context and a generation mask
+  With `--person-crop`, PowerPaint receives a square crop with 12% context and a generation mask
   dilated by 12 pixels at its 640-pixel working size. Only the original, undilated
   completion region is composited back; visible pixels remain exact.
 - PowerPaint v2 retains the official prediction code and weights, but constructs

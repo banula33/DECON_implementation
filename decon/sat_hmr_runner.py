@@ -21,7 +21,7 @@ def move_target_tensors(value, device):
     return value
 
 
-def export_predictions(outputs, targets, destination, threshold):
+def export_predictions(outputs, targets, destination, threshold, input_size=None):
     import numpy as np
     import torch
 
@@ -33,12 +33,19 @@ def export_predictions(outputs, targets, destination, threshold):
         for query in selected:
             def array(key):
                 return outputs[key][index][query].detach().cpu().numpy()
+            extras = {}
+            if 'pred_boxes' in outputs:
+                if input_size is None:
+                    raise ValueError("SAT-HMR input_size is required to export detection boxes")
+                cx, cy, width, height = array('pred_boxes') * input_size
+                extras['detection_box'] = np.array([cx-width/2, cy-height/2, cx+width/2, cy+height/2])
             np.savez_compressed(
                 destination / f'person_{count:03d}.npz',
                 vertices=array('pred_verts'), pose=array('pred_poses').reshape(24, 3),
                 shape=array('pred_betas').reshape(10), translation=array('pred_transl').reshape(3),
                 intrinsics=outputs['pred_intrinsics'][index].detach().cpu().numpy().reshape(3, 3),
                 resized_size=target['img_size'].detach().cpu().numpy(),
+                **extras,
             )
             count += 1
     return count
@@ -71,7 +78,7 @@ def main():
         targets = move_target_tensors(targets, device)
         with torch.inference_mode():
             outputs = model([sample.to(device) for sample in samples], targets)
-        export_predictions(outputs, targets, options.output_dir, options.threshold)
+        export_predictions(outputs, targets, options.output_dir, options.threshold, input_size=model.input_size)
 
 
 if __name__ == '__main__':

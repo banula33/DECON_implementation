@@ -92,12 +92,18 @@ class OfficialSAM2Segmenter:
         predictor = self._load()
         with torch.inference_mode():
             predictor.set_image(rgb)
+        # The released sam.py encodes the image outside autocast and enables
+        # bfloat16 for the prompted mask prediction only.
+        with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16,
+                                                   enabled=torch.device(self.device).type == 'cuda'):
             masks, _, _ = predictor.predict(box=box, multimask_output=False, **prompts)
         result = np.array(masks[0], dtype=np.bool_, copy=True)
         # A small hand can disappear when the entire high-resolution image is
         # encoded at SAM's fixed resolution. Re-encode explicitly selected local
         # regions, then add their visible foreground to the whole-person mask.
         for region in regions or []:
+            if not isinstance(region, dict) or 'box' not in region or 'points' not in region or 'labels' not in region:
+                raise ValueError("Each region must contain box, points, and labels")
             crop_box = np.asarray(region['box'])
             if crop_box.shape != (4,) or not np.isfinite(crop_box).all():
                 raise ValueError("Region box must contain four finite coordinates")
@@ -105,12 +111,15 @@ class OfficialSAM2Segmenter:
             if not (0 <= x0 < x1 <= rgb.shape[1] and 0 <= y0 < y1 <= rgb.shape[0]):
                 raise ValueError("Region box must lie inside the image")
             region_points = np.asarray(region['points'], dtype=np.float32) - [x0, y0]
+            region_labels = np.asarray(region['labels'])
+            if region_points.ndim != 2 or region_points.shape[1] != 2 or region_labels.shape != (len(region_points),):
+                raise ValueError("Region points must be Nx2 with one label per point")
             local_box = torch.as_tensor(region.get('prompt_box', [x0, y0, x1-1, y1-1]), dtype=torch.float32)
             if local_box.shape != (4,) or not torch.isfinite(local_box).all():
                 raise ValueError("Region prompt_box must contain four finite coordinates")
             local_box -= torch.tensor([x0, y0, x0, y0])
             local = self.segment(rgb[y0:y1, x0:x1], local_box,
-                                 points=region_points, labels=region['labels'])
+                                 points=region_points, labels=region_labels)
             result[y0:y1, x0:x1] |= local.numpy()
         return torch.from_numpy(result)
 
@@ -141,6 +150,8 @@ class OfficialPowerPaintInpainter:
         local_files_only: bool = True,
         crop_to_person: bool = True,
         mask_dilation: int = 12,
+        task: str = 'text-guided',
+        debug_directory: str | Path | None = None,
     ) -> None:
         self.root = _require_path(Path(inpainting_root).resolve(), "PowerPaint checkout")
         self.checkpoint_dir = _require_path(Path(checkpoint_dir).resolve(), "PowerPaint checkpoint")
@@ -150,6 +161,10 @@ class OfficialPowerPaintInpainter:
             raise ValueError("mask_dilation must be nonnegative")
         self.crop_to_person = crop_to_person
         self.mask_dilation = mask_dilation
+        if task not in ('text-guided', 'shape-guided'):
+            raise ValueError("task must be text-guided or shape-guided")
+        self.task = task
+        self.debug_directory = Path(debug_directory) if debug_directory else None
 
     def _load(self) -> Any:
         if self._controller is None:
@@ -206,10 +221,21 @@ class OfficialPowerPaintInpainter:
                 isolated, human_mask, completion_mask, dilation=self.mask_dilation,
             )
             input_image = {"image": crop, "mask": generation_mask}
+        if self.debug_directory is not None:
+            self.debug_directory.mkdir(parents=True, exist_ok=True)
+            input_image['image'].save(self.debug_directory/'generation_input.png')
+            input_image['mask'].save(self.debug_directory/'generation_mask.png')
         outputs, _ = controller.predict(
             input_image, prompt, fitting, steps, scale, seed, negative,
-            "text-guided", None, None,
+            self.task, None, None,
         )
+        if self.debug_directory is not None:
+            import json
+            outputs[0].save(self.debug_directory/'raw_generation.png')
+            (self.debug_directory/'transform.json').write_text(json.dumps({
+                'original_size':pil_image.size,'crop_box':box,
+                'raw_generation_size':outputs[0].size,'task':self.task,
+            },indent=2)+'\n')
         if box is not None:
             from .completion import restore_completion
             return restore_completion(outputs[0].convert("RGB"), isolated, completion_mask, box)
@@ -244,7 +270,10 @@ class PyTorch3DSilhouetteRenderer:
         )
         self.shader = SoftSilhouetteShader(blend_params=BlendParams(sigma=1e-4, gamma=1e-4))
 
-    def render_mask(self, vertices: Tensor, camera: Any) -> Tensor:
+    def render_mask_native(self, vertices: Tensor, camera: Any) -> Tensor:
+        return self.render_mask(vertices, camera, restore_resolution=False)
+
+    def render_mask(self, vertices: Tensor, camera: Any, *, restore_resolution=True) -> Tensor:
         from pytorch3d.structures import Meshes
         if isinstance(camera, PinholeCamera):
             if camera.image_size != self.image_size:
@@ -258,7 +287,7 @@ class PyTorch3DSilhouetteRenderer:
         fragments = self.rasterizer(meshes, cameras=camera)
         image = self.shader(fragments, meshes)[..., 3]
         mask = image[0]
-        if self.raster_size != self.image_size:
+        if restore_resolution and self.raster_size != self.image_size:
             mask = torch.nn.functional.interpolate(
                 mask[None, None], size=self.image_size, mode="bilinear", align_corners=False,
             )[0, 0]
@@ -311,10 +340,20 @@ class OfficialSATHMRGeometryEstimator:
                 camera = PinholeCamera.from_resized(
                     tensor("intrinsics"), tuple(int(x) for x in data["resized_size"]), image_size,
                 )
+                metadata = {"person_id": path.stem, "coordinate_system": "opencv_camera"}
+                if 'detection_box' in data:
+                    box = tensor('detection_box')
+                    rh, rw = (int(x) for x in data['resized_size'])
+                    h, w = image_size
+                    box *= box.new_tensor([w/rw, h/rh, w/rw, h/rh])
+                    margin = (box[2:]-box[:2]) * 0.025
+                    box = torch.cat((box[:2]-margin, box[2:]+margin))
+                    box = torch.minimum(box.clamp(min=0), box.new_tensor([w-1,h-1,w-1,h-1]))
+                    metadata['detection_box'] = box.cpu().tolist()
                 estimates.append(HumanEstimate(
                     vertices=tensor("vertices"), mask=torch.zeros(image_size, dtype=torch.bool, device=self.device),
                     camera=camera, pose=tensor("pose"), shape=tensor("shape"),
                     translation=tensor("translation"),
-                    metadata={"person_id": path.stem, "coordinate_system": "opencv_camera"},
+                    metadata=metadata,
                 ))
         return estimates

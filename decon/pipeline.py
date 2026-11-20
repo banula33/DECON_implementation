@@ -19,7 +19,7 @@ class HumanDecouplingPipeline:
         bbox_for_person: BoundingBoxer | None = None,
         ggdo_config: GGDOConfig | None = None,
         segmentation_prompts: dict | None = None,
-        completion_policy: str = 'occlusion',
+        completion_policy: str = 'silhouette',
     ) -> None:
         self.geometry_estimator = geometry_estimator
         self.segmenter = segmenter
@@ -27,6 +27,7 @@ class HumanDecouplingPipeline:
         self.inpainter = inpainter
         self.body_model = body_model
         self.bbox_for_person = bbox_for_person or self._default_bbox
+        self.use_detection_boxes = bbox_for_person is None
         self.ggdo_config = ggdo_config or GGDOConfig()
         self.segmentation_prompts = segmentation_prompts or {}
         if completion_policy not in ('occlusion', 'silhouette'):
@@ -38,6 +39,8 @@ class HumanDecouplingPipeline:
         results = []
         for index, estimate in enumerate(self.geometry_estimator.estimate(rgb)):
             box = self.bbox_for_person(estimate.vertices, estimate.camera)
+            if self.use_detection_boxes and estimate.metadata and 'detection_box' in estimate.metadata:
+                box = torch.as_tensor(estimate.metadata['detection_box'], device=box.device, dtype=box.dtype)
             correction = self.segmentation_prompts.get(str(index), {})
             if 'box' in correction:
                 box = torch.as_tensor(correction['box'], device=box.device, dtype=box.dtype)
@@ -52,11 +55,21 @@ class HumanDecouplingPipeline:
             estimate.mask = mask
             render = lambda vertices: self.renderer.render_mask(vertices, estimate.camera)
             initial_mask = render(estimate.vertices).detach()
+            fit_render, fit_mask = render, mask
+            native_render = getattr(self.renderer, 'render_mask_native', None)
+            if self.ggdo_config.fit_at_renderer_resolution and native_render is not None:
+                fit_render = lambda vertices: native_render(vertices, estimate.camera)
+                fit_mask = torch.nn.functional.interpolate(
+                    mask[None,None].float(),size=self.renderer.raster_size,mode='nearest',
+                )[0,0]
             ggdo = optimize_geometry(
-                estimate.vertices, mask, render, body_model=self.body_model,
+                estimate.vertices, fit_mask, fit_render, body_model=self.body_model,
                 pose=estimate.pose, shape=estimate.shape, translation=estimate.translation,
                 config=self.ggdo_config,
             )
+            if self.ggdo_config.fit_at_renderer_resolution and native_render is not None:
+                with torch.no_grad():
+                    ggdo.geometry_mask = render(ggdo.vertices).detach()
             completion = (ggdo.geometry_mask > 0.5) & ~mask
             segmented_image = isolate(rgb, mask)
             results.append(DecoupledPerson(

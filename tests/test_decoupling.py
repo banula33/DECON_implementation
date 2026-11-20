@@ -161,6 +161,22 @@ def test_empty_detections_fail():
         pipeline.run(Image.new('RGB', (10, 10)))
 
 
+@pytest.mark.parametrize('override', [False, True])
+def test_pipeline_prefers_detection_box_unless_explicitly_overridden(override):
+    camera = PinholeCamera(torch.tensor([[10.,0,5.],[0,10.,5.],[0,0,1.]]),(10,10))
+    estimate = HumanEstimate(torch.tensor([[-.2,-.2,2.],[.2,.2,2.]]),torch.ones(10,10),camera,
+                             metadata={'detection_box':[1.,2.,8.,9.]})
+    expected = torch.tensor([2.,3.,7.,8.] if override else [1.,2.,8.,9.])
+    def segment(_,box):
+        assert torch.equal(box,expected)
+        return torch.ones(10,10,dtype=torch.bool)
+    pipeline = HumanDecouplingPipeline(SimpleNamespace(estimate=lambda _: [estimate]),
+        SimpleNamespace(segment=segment),SimpleNamespace(render_mask=lambda *_:torch.ones(10,10)),
+        ggdo_config=GGDOConfig(translation_steps=0,pose_shape_steps=0),
+        bbox_for_person=(lambda *_:expected) if override else None)
+    pipeline.run(Image.new('RGB',(10,10)))
+
+
 def test_sam_receives_rgb_and_pixel_box(tmp_path):
     from decon.official_adapters import OfficialSAM2Segmenter
     adapter = OfficialSAM2Segmenter(tmp_path, device='cpu')
@@ -216,6 +232,23 @@ def test_sam_region_recovers_disconnected_piece_in_original_coordinates(tmp_path
                              regions=[{'box': [6, 7, 10, 11], 'points': [[7, 8]], 'labels': [1]}])
     assert result[1:4, 1:4].all() and result[8:10, 7:9].all()
     assert int(result.sum()) == 13
+
+
+def test_sam_region_prompt_validation(tmp_path):
+    from decon.official_adapters import OfficialSAM2Segmenter
+    adapter = OfficialSAM2Segmenter(tmp_path, device='cpu')
+    adapter._predictor = SimpleNamespace(
+        set_image=lambda _: None,
+        predict=lambda **_: (np.ones((1, 4, 4), bool), None, None),
+    )
+    image = Image.new('RGB', (4, 4))
+    box = torch.tensor([0, 0, 3, 3])
+    with pytest.raises(ValueError, match='box, points, and labels'):
+        adapter.segment(image, box, regions=[{'box': [0, 0, 2, 2]}])
+    with pytest.raises(ValueError, match='one label'):
+        adapter.segment(image, box, regions=[{
+            'box': [0, 0, 2, 2], 'points': [[1, 1]], 'labels': [],
+        }])
 
 
 def test_smpl_wrapper_preserves_translation_and_parameter_gradients(tmp_path, monkeypatch):
@@ -284,8 +317,10 @@ class Model(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.zeros(1))
+        self.input_size = 20
     def forward(self, samples, targets):
         return dict(pred_confs=torch.tensor([[[0.9]]]),
+                    pred_boxes=torch.tensor([[[0.25, 0.5, 0.3, 0.8]]]),
                     pred_verts=torch.tensor([[[[-1., -1., 3.], [1., 1., 3.]]]]),
                     pred_poses=torch.zeros(1, 1, 72), pred_betas=torch.zeros(1, 1, 10),
                     pred_transl=torch.tensor([[[0., 0., 3.]]]),
@@ -302,6 +337,7 @@ class Engine:
     assert torch.equal(people[0].translation, torch.tensor([0., 0., 3.]))
     assert people[0].camera.image_size == (40, 20)
     assert people[0].camera.intrinsics[0, 0] == 20
+    assert people[0].metadata['detection_box'] == pytest.approx([3.7, 3.2, 16.3, 36.8])
 
 
 @pytest.mark.parametrize('enabled', [True, False])

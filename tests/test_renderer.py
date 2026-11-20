@@ -56,6 +56,11 @@ def test_bounded_render_preserves_projection_resolution_and_gradients():
     mask = renderer.render_mask(vertices + translation, camera)
     assert renderer.raster_size == (16, 24)
     assert mask.shape == camera.image_size
+    native = renderer.render_mask_native(vertices + translation, camera)
+    assert native.shape == renderer.raster_size
+    restored = torch.nn.functional.interpolate(native[None,None],size=camera.image_size,
+                                                mode='bilinear',align_corners=False)[0,0]
+    assert torch.allclose(mask,restored)
     expected = reference.render_mask(vertices + translation.detach(), camera).detach()
     foreground = mask > .5
     target = expected > .5

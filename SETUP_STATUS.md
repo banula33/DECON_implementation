@@ -1,4 +1,33 @@
-# Real-image setup status — 19 November 2026
+# Real-image setup status — 20 November 2026
+
+## Latest segmentation and completion refinement
+
+The central blue player's missing visible wrist, tape and hand are now recovered
+with reviewed positive/negative points and a higher-detail local SAM crop. These
+are image-specific manual corrections; the pipeline does not automatically infer
+them for new photos. The CLI accepts reusable `--segmentation-prompts` JSON.
+
+Completion now defaults to filling predicted regions covered by another person's
+mask, with person-centered crops and a wider generation mask. Only the original
+completion region is composited back. This removes unnecessary generation around
+both walking subjects and the right football player and reduces dark edge
+artifacts on the white player and foreground dancer. The original silhouette
+policy and full-frame inpainting remain available for comparison.
+
+All seven revised outputs retain original resolution, exact visible-mask pixels,
+and white pixels outside the visible/completion region. Tests: 35 GPU passes;
+33 CPU passes with one optional module skipped. Comparisons and final prompts:
+[refinement report](outputs/refinement/REPORT.md). The final football artifacts
+are in `outputs/refinement/football_improved/`; original outputs are preserved.
+
+**Visual acceptance still fails for heavily occluded people.** The blue player's
+hidden arm is too thin and clothing has seams. The rear dancer has an invented
+colored object and an incorrect foot. The foreground dancer retains a narrow
+pale arm-edge artifact. These candidate completions are not accepted downstream
+reconstruction inputs. Improved segmentation does not establish accurate hidden
+anatomy.
+
+## Earlier baseline
 
 The real-image pipeline has completed SAT-HMR, geometry-prompted SAM 2, and
 both GGDO optimization stages for the three foreground players in the supplied
